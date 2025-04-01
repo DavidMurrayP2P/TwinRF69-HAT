@@ -9,3 +9,6 @@ Then open:
     raspi-config
 
 Ensure you enable SPI. Then save and reboot.
+
+Also, you will need to ensure that you swap the names of NODE and OTHER node in one of the two TwinRF69_test.py files.
+

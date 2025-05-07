@@ -2,7 +2,7 @@
 
 ### This page is incomplete and is a work in progress
 
-The purpose of this page is to document the different Wireless interface options that are avaliable on the raspberry pi, past the inbuilt WiFi and Bluetooth. 
+This page documents the different Wireless interface options that are avaliable on the Raspberry Pi, obviously going beyond the inbuilt WiFi and Bluetooth. 
 
 As you know the goal of this project is to make it as easy as possible to deply outdoor computing. We want to be able to easily deploy outdoor single board computers and have sensors or cameras report information back. A large comonent of this is networking and having wireless interfaces that ensure that we can collect the data over a wireless interface. 
 

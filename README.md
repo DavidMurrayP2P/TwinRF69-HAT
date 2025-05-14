@@ -1,6 +1,6 @@
 # TwinRF69
 
-The Twin RF69 project aims to extend the wireless capabilities of the Raspberry Pi ecosystem into two different frequencies in the sub 1GHz band. 
+The Twin RF69 project aims to extend the wireless capabilities of the Raspberry Pi ecosystem into two different frequencies in the sub 1GHz band. The goal of this is to provide a wireless mesh based alternative to WiFi that utilises longer range, lower power but can still talk IP. I've decided to go down the path of creating dedicated hardware after exploring all the viable options. You can read through and look at my dive into the [wireless_interface_options](WIRELESS_INTERFACE_RESEARCH.md) for the Raspberry Pi.
 
 ![Alt text](IMG/TwinRF69.png?raw=true "Title") <p style="text-align:center; font-style:italic;">A prototype of the TwinRF69</p>
 

@@ -10,9 +10,7 @@ You can find the user docs, showing you how to get started with the TwinRF69, an
 * [USERDOCS](USERDOCS.md) 
 * [DESIGN_AND_DECISIONS](DESIGN_AND_DECISIONS.md)
 
-![Alt text](IMG/TwinRF69_with_PPZ.png?raw=true "Title") <p style="text-align:center; font-style:italic;">This project works well with the  [Photon Power Zero](https://www.youtube.com/watch?v=qGwqMnN81YI) video. Photon Power Zero, pictured underneath. 
-
-The they operate as stackable hearders for the Raspberry Pi. This is designed around low power and potentially solar, battery operation and integration with the Photon Power Zero. You can find out more about hit project at the [Photon Power Zero Github](https://github.com/DavidMurrayP2P/PhotonPowerZero/). 
+![Alt text](IMG/TwinRF69_with_PPZ.png?raw=true "Title") <p style="text-align:center; font-style:italic;">This project works well with the [Photon Power Zero](https://www.youtube.com/watch?v=qGwqMnN81YI). Both the Photon Power Zero and the TwinRF69  operate as stackable hearders for the Raspberry Pi. This is designed around low power and potentially solar, battery operation and integration with the Photon Power Zero. You can find out more about hit project at the [Photon Power Zero Github](https://github.com/DavidMurrayP2P/PhotonPowerZero/). 
 
 As an open-source project, you can find the code for the Twin RF69, the Kicad PCB files and the FDM 3D printing files below
 * [Code](Code)

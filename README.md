@@ -10,7 +10,7 @@ You can find the user docs, showing you how to get started with the TwinRF69, an
 * [USERDOCS](USERDOCS.md) 
 * [DESIGN_AND_DECISIONS](DESIGN_AND_DECISIONS.md)
 
-![Alt text](IMG/TwinRF69_with_PPZ.png?raw=true "Title") <p style="text-align:center; font-style:italic;">This project works well with the  [Soldering a header on a Raspberry Pi Zero 2](https://youtu.be/pwCCnsn2Mug) video. Photon Power Zero, pictured underneath. 
+![Alt text](IMG/TwinRF69_with_PPZ.png?raw=true "Title") <p style="text-align:center; font-style:italic;">This project works well with the  [Photon Power Zero](https://www.youtube.com/watch?v=qGwqMnN81YI) video. Photon Power Zero, pictured underneath. 
 
 The they operate as stackable hearders for the Raspberry Pi. This is designed around low power and potentially solar, battery operation and integration with the Photon Power Zero. You can find out more about hit project at the [Photon Power Zero Github](https://github.com/DavidMurrayP2P/PhotonPowerZero/). 
 

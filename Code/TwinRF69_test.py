@@ -78,9 +78,9 @@ def main():
     MODULE1 = RF69_915MHZ
     FREQUENCY0 = 433000000
     FREQUENCY1 = 915000000
-    NODE_ID = 1 
+    NODE_ID = 1
+    OTHERNODE = 0
     NETWORK_ID = 0
-    OTHERNODE = 2
     TOSLEEP = 0.01
     TIMEOUT = 1
 
@@ -122,7 +122,7 @@ def main():
 
                 # Convert bytes to a list of integers
                 data_as_list = list(chunk)
-                msg = "%d, %d, %d\n" % (NODE, sequence, chunky)
+                msg = "%d, %d, %d\n" % (NODE_ID, sequence, chunky)
 
                 if sequence % 2 == 1:
                     radio0.send(OTHERNODE, msg)  # Send without retrying for ACK

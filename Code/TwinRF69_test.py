@@ -7,8 +7,12 @@ import RPi.GPIO as GPIO
 
 #You must set these two variables
 
-REGION = 0 # Set to 1 for 433/915 and 2 for 433/868
-NODE_ID = 0 #Set this to an integer between 0 and 9
+REGION = 1 # Set to 1 for 433/915 and 2 for 433/868
+NODE_ID = 2 #Set this to an integer between 0 and 9
+OTHERNODE = 1
+NETWORK_ID = 0
+TOSLEEP = 0.01
+TIMEOUT = 1
 
 class RegionNotSetError(Exception):
     """Please set the appropriate region"""
@@ -46,10 +50,8 @@ def setup_radios(MODULE, FREQUENCY, NODE_ID, NETWORK_ID, INT_PIN, RST_PIN, SPI_B
     print(radio.readTemperature(0))
 
     radio.setFrequency(FREQUENCY)
-
     radio.writeReg(REG_BITRATEMSB, RF_BITRATEMSB_250000)
     radio.writeReg(REG_BITRATELSB, RF_BITRATELSB_250000)
-
     radio.writeReg(REG_FDEVMSB, RF_FDEVMSB_50000)
     radio.writeReg(REG_FDEVLSB, RF_FDEVLSB_50000)
 
@@ -80,6 +82,35 @@ def divide_file_into_chunks(file_path, chunk_size):
     print(f"Total number of chunks: {len(chunks)}")
     return chunks
 
+def neighbour_discovery(radio0):
+    for number in range(1, 10):
+        # Broadcasting Node ID on control
+        hello_msg = "%d\n" % (NODE_ID) 
+        radio0.send(OTHERNODE, hello_msg) #Send without retrying for ack
+        print("Sending " +str(number))
+        
+        radio0.receiveBegin()
+        start_time = time.time()
+        received = False
+        timedOut = 0
+        TIMEOUT_DURATION = 2
+        while not (radio0.receiveDone()):
+            time.sleep(TOSLEEP)
+
+            elapsed_time = time.time() - start_time
+            if elapsed_time > TIMEOUT_DURATION:
+                print(f"Timeout after {TIMEOUT_DURATION} seconds waiting for response.")
+                break  # Exit the while loop after timeout
+
+        # After exiting the loop, check if data was received
+        if radio0.receiveDone():
+            print(f"Received data: {radio0.DATA}")
+            received = True
+        else:
+            print("No data received within the timeout period.")
+
+    print("Neighbour discovery process completed.")
+
 def main():
 
     if (REGION == 1):
@@ -96,11 +127,6 @@ def main():
     # Constants for configuration
     MODULE0 = RF69_433MHZ
     FREQUENCY0 = 433000000
-    NODE_ID = 1
-    OTHERNODE = 0
-    NETWORK_ID = 0
-    TOSLEEP = 0.01
-    TIMEOUT = 1
 
     OUTPUT_FILE = 'received_file.png'  # File to write received data
     file_path = 'logo.png'
@@ -119,10 +145,12 @@ def main():
         radio0 = setup_radios(MODULE0, FREQUENCY0, NODE_ID, NETWORK_ID, 16, 15, 0, 0)
         radio1 = setup_radios(MODULE1, FREQUENCY1, NODE_ID, NETWORK_ID, 18, 22, 0, 1)
 
+        neighbour_discovery(radio0)
+
         # Display the menu options to the user
         print("Please choose an option:")
-        print("1. Send")
-        print("2. Receive")
+        print("1. Send a file")
+        print("2. Receive a file")
 
         # Read the user's response from the keyboard
         response = input("Enter 1 or 2: ")
@@ -144,17 +172,14 @@ def main():
                     data_as_list = list(chunk)
                     msg = "%d, %d, %d\n" % (NODE_ID, sequence, chunky)
 
-                    if sequence % 2 == 1:
-                        radio0.send(OTHERNODE, msg)  # Send without retrying for ACK
-                        print("TX >> {OTHERNODE}: 433 {msg}")
-                    else: 
-                        radio1.send(OTHERNODE, msg)  # Send without retrying for ACK
-                        print("TX >> {OTHERNODE}: 915 {msg}")
+                    radio1.send(OTHERNODE, msg)  # Send without retrying for ACK
+                    print("TX >> {OTHERNODE}: 915 {msg}")
                     time.sleep(0.16)
 
-                    #if (sequence == 100):
-                    #    sequence = 0
-                    #    msg = "%d, %d, 915\n" % (NODE, sequence)
+                    if ((sequence%10)==5):
+                        ack = "%d, %d, %d\n" % (NODE_ID, 99, 0)
+                        print("TX >> {OTHERNODE}: 433 {ack}")
+                        radio0.send(OTHERNODE, ack)  # Send without retrying for ACK
 
 
                     #print("Receiving...")
@@ -192,27 +217,26 @@ def main():
                     while True:
                         GPIO.output(led, GPIO.LOW)
 
-                        radio1.receiveBegin()
                         radio0.receiveBegin()
+                        radio1.receiveBegin()
                         timedOut = 0
                         while not ((radio1.receiveDone()) or (radio0.receiveDone())):
                             time.sleep(TOSLEEP)
                         
-                        #while not radio0.receiveDone():
-                        #    time.sleep(TOSLEEP)
-
                         if timedOut <= TIMEOUT:
                             #GPIO.output(led, GPIO.HIGH)
                             #sender = radio1.SENDERID
                             #sender = radio0.SENDERID
 
                             # Log the received data
-                            print(f"RX << {radio0.SENDERID}: (RSSI: {radio0.RSSI} {radio0.DATA}) 433MHz")
-                            print(f"RX << {radio1.SENDERID}: (RSSI: {radio1.RSSI} {radio1.DATA}) 915MHz")
+                            if (radio0.RSSI < 0):
+                                print(f"RX << {radio0.SENDERID}: (RSSI: {radio0.RSSI} {radio0.DATA}) 433MHz")
+                            if (radio1.RSSI < 1):
+                                print(f"RX << {radio1.SENDERID}: (RSSI: {radio1.RSSI} {radio1.DATA}) 915MHz")
 
                             # Write the received data to the file
                             f.write(bytearray(radio1.DATA))
-                            f.write(bytearray(radio0.DATA))
+                            #f.write(bytearray(radio0.DATA))
                             f.flush()  # Ensure the data is written to disk immediately
 
                             # Process ACK if needed
@@ -229,6 +253,7 @@ def main():
                 # Cleanup GPIO and shutdown radio properly
                 GPIO.output(led, GPIO.LOW)
                 radio1.shutdown()
+                radio0.shutdown()
                 print("Shutdown complete")
                 
                 # Read the file and extract the second column values
@@ -272,4 +297,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

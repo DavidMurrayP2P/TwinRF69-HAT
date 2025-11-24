@@ -180,6 +180,7 @@ def main():
                         ack = "%d, %d, %d\n" % (NODE_ID, 99, 0)
                         print("TX >> {OTHERNODE}: 433 {ack}")
                         radio0.send(OTHERNODE, ack)  # Send without retrying for ACK
+                        time.sleep(0.16)
 
 
                     #print("Receiving...")

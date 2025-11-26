@@ -8,8 +8,8 @@ import RPi.GPIO as GPIO
 #You must set these two variables
 
 REGION = 1 # Set to 1 for 433/915 and 2 for 433/868
-NODE_ID = 2 #Set this to an integer between 0 and 9
-OTHERNODE = 1
+NODE_ID = 1 #Set this to an integer between 0 and 9
+OTHERNODE = 2
 NETWORK_ID = 0
 TOSLEEP = 0.01
 TIMEOUT = 1
@@ -83,7 +83,7 @@ def divide_file_into_chunks(file_path, chunk_size):
     return chunks
 
 def neighbour_discovery(radio0):
-    for number in range(1, 10):
+    for number in range(1, 5):
         # Broadcasting Node ID on control
         hello_msg = "%d\n" % (NODE_ID) 
         radio0.send(OTHERNODE, hello_msg) #Send without retrying for ack
@@ -106,10 +106,126 @@ def neighbour_discovery(radio0):
         if radio0.receiveDone():
             print(f"Received data: {radio0.DATA}")
             received = True
+            number =5
         else:
             print("No data received within the timeout period.")
 
     print("Neighbour discovery process completed.")
+
+def check_missing_packets(OUTPUT_FILE): 
+
+    print("We're going to check for missing packets")
+    
+    # Read the file and extract the second column values
+    with open(OUTPUT_FILE, 'r') as file:
+        received_numbers = [int(line.split(',')[1]) for line in file]
+
+        if received_numbers:
+            # The first and last sequence numbers
+            first_seq = received_numbers[0]
+            last_seq = received_numbers[-1]
+
+            # Define the expected range of numbers from first_seq to last_seq
+            expected_range = set(range(first_seq, last_seq + 1))
+            # Convert received numbers to a set
+            received_set = set(received_numbers)
+
+            # Find the missing numbers
+            missing_numbers = expected_range - received_set
+
+            # Calculate the loss rate
+            total_expected = len(expected_range)
+            total_received = len(received_set)
+            total_missing = len(missing_numbers)
+
+            loss_rate = (total_missing / total_expected) * 100
+
+            print(f"Missing numbers: {sorted(missing_numbers)}")
+            print(f"Total expected packets: {total_expected}")
+            print(f"Total received packets: {total_received}")
+            print(f"Total missing packets: {total_missing}")
+            print(f"Packet loss rate: {loss_rate:.2f}%")
+
+def send_packet(file_path, chunk_size, radio0, radio1):
+
+    chunks = divide_file_into_chunks(file_path, chunk_size)
+    sequence = 0
+    chunky = 1337
+
+    try:
+        for chunk in chunks:
+            #msg = int_to_61_char_string(sequence)
+            #msg = "%d, %d, %d\n" % (NODE, sequence, chunk)
+            sequence += 1
+
+            # Convert bytes to a list of integers
+            data_as_list = list(chunk)
+            msg = "%d, %d, %d\n" % (NODE_ID, sequence, chunky)
+
+            radio1.send(OTHERNODE, msg)  # Send without retrying for ACK
+            print("TX >> {OTHERNODE}: 915 {msg}")
+            time.sleep(0.16)
+
+            if ((sequence%10)==5):
+                ack = "%d, %d, %d\n" % (NODE_ID, 99, 0)
+                print("TX >> {OTHERNODE}: 433 {ack}")
+                radio0.send(OTHERNODE, ack)  # Send without retrying for ACK
+                time.sleep(0.16)
+
+    except KeyboardInterrupt:
+        # Clean up properly to not leave GPIO/SPI in an unusable state
+        pass
+
+def receive_packet(OUTPUT_FILE, radio0, radio1, TOSLEEP, TIMEOUT):
+    # Clear the contents of the output file
+    open(OUTPUT_FILE, 'w').close()
+
+    try:
+        # Open the output file in binary append mode
+        with open(OUTPUT_FILE, 'wb') as f:
+            while True:
+                #GPIO.output(led, GPIO.LOW)
+                
+                radio0.receiveBegin()
+                radio1.receiveBegin()
+                timedOut = 0
+                while not ((radio1.receiveDone()) or (radio0.receiveDone())):
+                    time.sleep(TOSLEEP)
+
+                    if timedOut <= TIMEOUT:
+                        #GPIO.output(led, GPIO.HIGH)
+                        #sender = radio1.SENDERID
+                        #sender = radio0.SENDERID
+
+                        # Log the received data
+                        if (radio0.RSSI < 0):
+                            print(f"RX << {radio0.SENDERID}: (RSSI: {radio0.RSSI} {radio0.DATA}) 433MHz")
+                        if (radio1.RSSI < 0):
+                            print(f"RX << {radio1.SENDERID}: (RSSI: {radio1.RSSI} {radio1.DATA}) 915MHz")
+
+                        # Write the received data to the file
+                        f.write(bytearray(radio1.DATA))
+                        #f.write(bytearray(radio0.DATA))
+                        f.flush()  # Ensure the data is written to disk immediately
+
+                        # Process ACK if needed
+                        #ackReq = radio1.ACKRequested()
+                        #ackReq = radio0.ACKRequested()
+
+                        #time.sleep(TIMEOUT / 2)
+
+    except KeyboardInterrupt:
+        # Handle program termination gracefully
+        print("Interrupt received, shutting down...")
+        check_missing_packets(OUTPUT_FILE)
+
+    finally:
+        # Cleanup GPIO and shutdown radio properly
+        GPIO.output(led, GPIO.LOW)
+        radio1.shutdown()
+        radio0.shutdown()
+        print("Shutdown complete")
+        check_missing_packets(OUTPUT_FILE)
 
 def main():
 
@@ -157,136 +273,10 @@ def main():
 
         # Check the user's response and perform the corresponding action
         if response == '1':
-            
-            chunks = divide_file_into_chunks(file_path, chunk_size)
-            sequence = 0
-            chunky = 1337
-
-            try:
-                for chunk in chunks:
-                    #msg = int_to_61_char_string(sequence)
-                    #msg = "%d, %d, %d\n" % (NODE, sequence, chunk)
-                    sequence += 1
-
-                    # Convert bytes to a list of integers
-                    data_as_list = list(chunk)
-                    msg = "%d, %d, %d\n" % (NODE_ID, sequence, chunky)
-
-                    radio1.send(OTHERNODE, msg)  # Send without retrying for ACK
-                    print("TX >> {OTHERNODE}: 915 {msg}")
-                    time.sleep(0.16)
-
-                    if ((sequence%10)==5):
-                        ack = "%d, %d, %d\n" % (NODE_ID, 99, 0)
-                        print("TX >> {OTHERNODE}: 433 {ack}")
-                        radio0.send(OTHERNODE, ack)  # Send without retrying for ACK
-                        time.sleep(0.16)
-
-
-                    #print("Receiving...")
-                    #radio.receiveBegin()
-                    #timedOut = 0
-                    #while not radio.receiveDone():
-                    #    timedOut += TOSLEEP
-                    #    time.sleep(TOSLEEP)
-                    #    if timedOut > TIMEOUT:
-                    #        print("Nothing received")
-                    #        break
-
-                    #if timedOut <= TIMEOUT:
-                    #    sender = radio.SENDERID
-                    #    msg = "".join([chr(letter) for letter in radio.DATA])
-                    #    print(f"RX << {sender}: {msg} (RSSI: {radio.RSSI})")
-                    #    # Removed ACK-related processing
-                    #    time.sleep(TIMEOUT / 2)
-                print("Finished Transmitting Message")
-                # Add code here to perform a site survey
-            
-            except KeyboardInterrupt:
-                # Clean up properly to not leave GPIO/SPI in an unusable state
-                pass
+            send_packet(file_path, chunk_size, radio0, radio1)
 
         elif response == '2':
-
-            # Clear the contents of the output file
-            open(OUTPUT_FILE, 'w').close()
-
-            print("Starting loop...")
-            try:
-                # Open the output file in binary append mode
-                with open(OUTPUT_FILE, 'wb') as f:
-                    while True:
-                        GPIO.output(led, GPIO.LOW)
-
-                        radio0.receiveBegin()
-                        radio1.receiveBegin()
-                        timedOut = 0
-                        while not ((radio1.receiveDone()) or (radio0.receiveDone())):
-                            time.sleep(TOSLEEP)
-                        
-                        if timedOut <= TIMEOUT:
-                            #GPIO.output(led, GPIO.HIGH)
-                            #sender = radio1.SENDERID
-                            #sender = radio0.SENDERID
-
-                            # Log the received data
-                            if (radio0.RSSI < 0):
-                                print(f"RX << {radio0.SENDERID}: (RSSI: {radio0.RSSI} {radio0.DATA}) 433MHz")
-                            if (radio1.RSSI < 1):
-                                print(f"RX << {radio1.SENDERID}: (RSSI: {radio1.RSSI} {radio1.DATA}) 915MHz")
-
-                            # Write the received data to the file
-                            f.write(bytearray(radio1.DATA))
-                            #f.write(bytearray(radio0.DATA))
-                            f.flush()  # Ensure the data is written to disk immediately
-
-                            # Process ACK if needed
-                            #ackReq = radio1.ACKRequested()
-                            #ackReq = radio0.ACKRequested()
-                            
-                            #time.sleep(TIMEOUT / 2)
-
-            except KeyboardInterrupt:
-                # Handle program termination gracefully
-                print("Interrupt received, shutting down...")
-
-            finally:
-                # Cleanup GPIO and shutdown radio properly
-                GPIO.output(led, GPIO.LOW)
-                radio1.shutdown()
-                radio0.shutdown()
-                print("Shutdown complete")
-                
-                # Read the file and extract the second column values
-                with open(OUTPUT_FILE, 'r') as file:
-                    received_numbers = [int(line.split(',')[1]) for line in file]
-
-            if received_numbers:
-                # The first and last sequence numbers
-                first_seq = received_numbers[0]
-                last_seq = received_numbers[-1]
-
-                # Define the expected range of numbers from first_seq to last_seq
-                expected_range = set(range(first_seq, last_seq + 1))
-                # Convert received numbers to a set
-                received_set = set(received_numbers)
-
-                # Find the missing numbers
-                missing_numbers = expected_range - received_set
-
-                # Calculate the loss rate
-                total_expected = len(expected_range)
-                total_received = len(received_set)
-                total_missing = len(missing_numbers)
-
-                loss_rate = (total_missing / total_expected) * 100
-
-                print(f"Missing numbers: {sorted(missing_numbers)}")
-                print(f"Total expected packets: {total_expected}")
-                print(f"Total received packets: {total_received}")
-                print(f"Total missing packets: {total_missing}")
-                print(f"Packet loss rate: {loss_rate:.2f}%")
-
+            receive_packet(OUTPUT_FILE, radio0, radio1, TOSLEEP, TIMEOUT)
 
         else:
             print("Invalid input. Please enter 1 or 2.")
@@ -298,5 +288,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

@@ -8,8 +8,8 @@ import RPi.GPIO as GPIO
 #You must set these two variables
 
 REGION = 1 # Set to 1 for 433/915 and 2 for 433/868
-NODE_ID = 1 #Set this to an integer between 0 and 9
-OTHERNODE = 2
+NODE_ID = 2 #Set this to an integer between 0 and 9
+OTHERNODE = 1
 NETWORK_ID = 0
 TOSLEEP = 0.01
 TIMEOUT = 1
@@ -83,34 +83,32 @@ def divide_file_into_chunks(file_path, chunk_size):
     return chunks
 
 def neighbour_discovery(radio0):
-    for number in range(1, 5):
+
+    print("Searching for a neighbour")
+    neighbour_discovered = False
+    while (neighbour_discovered is False):
         # Broadcasting Node ID on control
         hello_msg = "%d\n" % (NODE_ID) 
         radio0.send(OTHERNODE, hello_msg) #Send without retrying for ack
-        print("Sending " +str(number))
         
         radio0.receiveBegin()
         start_time = time.time()
-        received = False
         timedOut = 0
-        TIMEOUT_DURATION = 2
+        TIMEOUT_DURATION = 1
         while not (radio0.receiveDone()):
             time.sleep(TOSLEEP)
 
             elapsed_time = time.time() - start_time
             if elapsed_time > TIMEOUT_DURATION:
-                print(f"Timeout after {TIMEOUT_DURATION} seconds waiting for response.")
+                #print(f"Timeout after {TIMEOUT_DURATION} seconds waiting for response.")
                 break  # Exit the while loop after timeout
 
         # After exiting the loop, check if data was received
         if radio0.receiveDone():
             print(f"Received data: {radio0.DATA}")
-            received = True
-            number =5
-        else:
-            print("No data received within the timeout period.")
-
-    print("Neighbour discovery process completed.")
+            neighbour_discovered = True
+            print("Neighbour discovery process completed.")
+            radio0.send(OTHERNODE, hello_msg) #Send without retrying for ack
 
 def check_missing_packets(OUTPUT_FILE): 
 
@@ -140,11 +138,13 @@ def check_missing_packets(OUTPUT_FILE):
 
             loss_rate = (total_missing / total_expected) * 100
 
-            print(f"Missing numbers: {sorted(missing_numbers)}")
-            print(f"Total expected packets: {total_expected}")
-            print(f"Total received packets: {total_received}")
-            print(f"Total missing packets: {total_missing}")
-            print(f"Packet loss rate: {loss_rate:.2f}%")
+            #print(f"Missing numbers: {sorted(missing_numbers)}")
+            #print(f"Total expected packets: {total_expected}")
+            #print(f"Total received packets: {total_received}")
+            #print(f"Total missing packets: {total_missing}")
+            #print(f"Packet loss rate: {loss_rate:.2f}%")
+
+            return(missing_numbers)
 
 def send_packet(file_path, chunk_size, radio0, radio1):
 
@@ -166,11 +166,23 @@ def send_packet(file_path, chunk_size, radio0, radio1):
             print("TX >> {OTHERNODE}: 915 {msg}")
             time.sleep(0.16)
 
-            if ((sequence%10)==5):
-                ack = "%d, %d, %d\n" % (NODE_ID, 99, 0)
-                print("TX >> {OTHERNODE}: 433 {ack}")
-                radio0.send(OTHERNODE, ack)  # Send without retrying for ACK
-                time.sleep(0.16)
+        ack = "%d, %d, %d\n" % (NODE_ID, 99, 0)
+        print("TX >> {OTHERNODE}: 433 {ack}")
+        radio0.send(OTHERNODE, ack)  # Send without retrying for ACK
+        time.sleep(0.16)
+
+    except KeyboardInterrupt:
+        # Clean up properly to not leave GPIO/SPI in an unusable state
+        pass
+
+def send_ack(radio0, missing_packet):
+
+    try:
+        msg = "%d, %d, %d\n" % (NODE_ID, missing_packet, chunky)
+
+        radio0.send(OTHERNODE, msg)  # Send without retrying for ACK
+        print("TX >> {OTHERNODE}: 433 {msg}")
+        time.sleep(0.16)
 
     except KeyboardInterrupt:
         # Clean up properly to not leave GPIO/SPI in an unusable state
@@ -200,6 +212,12 @@ def receive_packet(OUTPUT_FILE, radio0, radio1, TOSLEEP, TIMEOUT):
                         # Log the received data
                         if (radio0.RSSI < 0):
                             print(f"RX << {radio0.SENDERID}: (RSSI: {radio0.RSSI} {radio0.DATA}) 433MHz")
+                            print("Checking for missing packets")
+                            missing_packets = check_missing_packets(OUTPUT_FILE)
+                            for missing_packet in missing_packets:
+                                print(missing_packet)
+                                send_ack(radio0, missing_packet)
+
                         if (radio1.RSSI < 0):
                             print(f"RX << {radio1.SENDERID}: (RSSI: {radio1.RSSI} {radio1.DATA}) 915MHz")
 
@@ -263,23 +281,24 @@ def main():
 
         neighbour_discovery(radio0)
 
-        # Display the menu options to the user
-        print("Please choose an option:")
-        print("1. Send a file")
-        print("2. Receive a file")
+        while True: 
+            # Display the menu options to the user
+            print("Please choose an option:")
+            print("1. Send a file")
+            print("2. Receive a file")
 
-        # Read the user's response from the keyboard
-        response = input("Enter 1 or 2: ")
+            # Read the user's response from the keyboard
+            response = input("Enter 1 or 2: ")
 
-        # Check the user's response and perform the corresponding action
-        if response == '1':
-            send_packet(file_path, chunk_size, radio0, radio1)
+            # Check the user's response and perform the corresponding action
+            if response == '1':
+                send_packet(file_path, chunk_size, radio0, radio1)
 
-        elif response == '2':
-            receive_packet(OUTPUT_FILE, radio0, radio1, TOSLEEP, TIMEOUT)
+            elif response == '2':
+                receive_packet(OUTPUT_FILE, radio0, radio1, TOSLEEP, TIMEOUT)
 
-        else:
-            print("Invalid input. Please enter 1 or 2.")
+            else:
+                print("Invalid input. Please enter 1 or 2.")
 
     except:
         print("Shutting down RFM69 modules")

@@ -8,8 +8,8 @@ import RPi.GPIO as GPIO
 #You must set these two variables
 
 REGION = 1 # Set to 1 for 433/915 and 2 for 433/868
-NODE_ID = 2 #Set this to an integer between 0 and 9
-OTHERNODE = 1
+NODE_ID = 1 #Set this to an integer between 0 and 9
+OTHERNODE = 2
 NETWORK_ID = 0
 TOSLEEP = 0.01
 TIMEOUT = 1
@@ -307,4 +307,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -17,7 +17,7 @@ REGION = 1 # Set to 1 for 433/915 and 2 for 433/868
 NODE_ID = 1 #Set this to an integer between 0 and 9
 OTHERNODE = 2
 NETWORK_ID = 0
-TOSLEEP = 0.01
+TOSLEEP = 0.016
 TIMEOUT = 1
 
 class RegionNotSetError(Exception):
@@ -30,7 +30,7 @@ def setup_radios(MODULE, FREQUENCY, NODE_ID, NETWORK_ID, INT_PIN, RST_PIN, SPI_B
     radio = RFM69.RFM69(
         freqBand=MODULE,  # Frequency band
         nodeID=NODE_ID,           # Node ID
-        networkID=NETWORK_ID,         # Network ID
+        networkID=NETWORK_ID,         # Network ID5
         isRFM69HW=True,        # High-power version flag
         intPin=INT_PIN,             # Custom interrupt pin
         rstPin=RST_PIN,             # Custom reset pin
@@ -162,13 +162,9 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: 
     Protocol:
       - Each payload = 4-byte header + chunk
       - Header = MSGID (uint16 BE), SEQ (uint16 BE)
-      - SEQ 0..N-1 = data chunks
+      - SEQ 1..N = data chunks (starts at 1, not 0, to avoid RFM69 dropping first packet)
       - SEQ == 0xFFFF = END marker; its payload after header is two uint16 BE:
            total_chunks, orig_len
-
-    This function will try to use a next_msg_id() function defined in the module (if present).
-    If not found, it falls back to a time-based 16-bit msgid.
-    The function attempts to send bytes; if radio.send rejects bytes it falls back to sending a list of ints.
     """
 
     if not isinstance(pkt, (bytes, bytearray)):
@@ -193,23 +189,26 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: 
         for seq in range(total_chunks):
             start = seq * chunk_size
             chunk = pkt[start:start + chunk_size]
-            header = struct.pack(">HH", msgid, seq)  # MSGID, SEQ
+            # Use seq+1 so sequence numbers start at 1, not 0 (avoids RFM69 dropping first packet)
+            actual_seq = seq + 1
+            header = struct.pack(">HH", msgid, actual_seq)  # MSGID, SEQ
             payload = header + chunk
 
-            # radio.send may accept bytes, strings, or list[int] depending on wrapper;
-            # try bytes first, fallback to list of ints.
+            time.sleep(TOSLEEP)
+            time.sleep(TOSLEEP)
             try:
                 radio.send(OTHERNODE, payload)
             except TypeError:
-            #    print("Invalid input. Please enter 1 or 2.")
                 radio.send(OTHERNODE, list(payload))
 
-            print(f"TX >> {OTHERNODE}: msgid={msgid} seq={seq+1}/{total_chunks} chunk_len={len(chunk)}")
-            time.sleep(pause)
+            print(f"TX >> {OTHERNODE}: msgid={msgid} seq={actual_seq}/{total_chunks} chunk_len={len(chunk)}")
 
         # send END marker with total_chunks and original length (both uint16 BE)
         end_header = struct.pack(">HH", msgid, 0xFFFF)
         end_payload = end_header + struct.pack(">HH", total_chunks & 0xFFFF, total_len & 0xFFFF)
+
+
+        time.sleep(TOSLEEP)
         try:
             radio.send(OTHERNODE, end_payload)
         except TypeError:
@@ -218,12 +217,139 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: 
         print(f"TX >> {OTHERNODE}: msgid={msgid} END total_chunks={total_chunks} orig_len={total_len}")
 
     except KeyboardInterrupt:
-        # allow clean interruption
         print("send_packet: interrupted by user")
         raise
     except Exception as e:
         print(f"send_packet: error while sending: {e}")
         raise
+
+
+def receive_packet_simple(radio_rx):
+    """
+    Non-blocking receive that checks if a packet is available and prints it.
+    
+    Parameters:
+      radio_rx: RFM69 radio object
+    
+    Returns:
+      None (prints directly to screen)
+    """
+    if radio_rx.receiveDone():
+        sender_id = radio_rx.SENDERID
+        rssi = radio_rx.RSSI
+        data = radio_rx.DATA
+        
+        # Convert DATA (which is a list of ints) to bytes if needed
+        if isinstance(data, (list, tuple)):
+            data_bytes = bytes(data)
+        else:
+            data_bytes = data
+        
+        # Print to screen
+        print(f"RX << {sender_id}: RSSI={rssi} Data={data_bytes} Length={len(data_bytes)}")
+
+        # Re-arm the receiver to accept the next packet
+        radio_rx.receiveBegin()
+
+# Module-level dictionary to track incoming message fragments
+_rx_buffers = {}  # {msgid: {seq: chunk_bytes, ...}}
+_rx_timestamps = {}  # {msgid: timestamp}
+
+def receive_packet_reassemble(radio_rx):
+    """
+    Non-blocking receive that reassembles fragmented packets.
+    Expects SEQ to start at 1 (not 0) to match fixed sender.
+    """
+    global _rx_buffers, _rx_timestamps
+    
+    if not radio_rx.receiveDone():
+        return
+    
+    sender_id = radio_rx.SENDERID
+    rssi = radio_rx.RSSI
+    data = radio_rx.DATA
+    
+    if isinstance(data, (list, tuple)):
+        data_bytes = bytes(data)
+    else:
+        data_bytes = data
+    
+    print(f"[RX RAW] {sender_id}: RSSI={rssi} raw_len={len(data_bytes)}")
+    
+    if len(data_bytes) < 4:
+        radio_rx.receiveBegin()
+        return
+    
+    try:
+        msgid, seq = struct.unpack(">HH", data_bytes[:4])
+        chunk = data_bytes[4:]
+    except Exception as e:
+        print(f"[RX ERROR] Failed to parse header: {e}")
+        radio_rx.receiveBegin()
+        return
+    
+    current_time = time.time()
+    msg_key = (sender_id, msgid)
+    
+    # Clean up old messages
+    expired_keys = [key for key, ts in _rx_timestamps.items() if current_time - ts > 10.0]
+    for key in expired_keys:
+        _rx_buffers.pop(key, None)
+        _rx_timestamps.pop(key, None)
+    
+    if msg_key not in _rx_buffers:
+        _rx_buffers[msg_key] = {}
+        _rx_timestamps[msg_key] = current_time
+    
+    if seq == 0xFFFF:
+        # END marker received
+        print(f"[RX END] {sender_id}: msgid={msgid}")
+        
+        if len(chunk) < 4:
+            _rx_buffers.pop(msg_key, None)
+            _rx_timestamps.pop(msg_key, None)
+            radio_rx.receiveBegin()
+            return
+        
+        try:
+            total_chunks, orig_len = struct.unpack(">HH", chunk[:4])
+        except Exception as e:
+            _rx_buffers.pop(msg_key, None)
+            _rx_timestamps.pop(msg_key, None)
+            radio_rx.receiveBegin()
+            return
+        
+        chunks_received = len(_rx_buffers[msg_key])
+        received_seqs = sorted(_rx_buffers[msg_key].keys())
+        
+        print(f"[RX DEBUG] {sender_id}: msgid={msgid} received {chunks_received}/{total_chunks} chunks: {received_seqs}")
+        
+        if chunks_received != total_chunks:
+            print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")
+            _rx_buffers.pop(msg_key, None)
+            _rx_timestamps.pop(msg_key, None)
+            radio_rx.receiveBegin()
+            return
+        
+        # Reassemble chunks in order (seq starts at 1, not 0)
+        reassembled = b''
+        for i in range(1, total_chunks + 1):  # 1..total_chunks
+            reassembled += _rx_buffers[msg_key][i]
+        
+        reassembled = reassembled[:orig_len]
+        
+        print(f"[RX COMPLETE] {sender_id}: msgid={msgid} reassembled {len(reassembled)} bytes")
+        print(f"[RX DATA] {reassembled}")
+        
+        _rx_buffers.pop(msg_key, None)
+        _rx_timestamps.pop(msg_key, None)
+    
+    else:
+        # Data chunk
+        _rx_buffers[msg_key][seq] = chunk
+        print(f"[RX CHUNK] {sender_id}: msgid={msgid} seq={seq} chunk_len={len(chunk)}")
+    
+    radio_rx.receiveBegin()
 
 def main():
 
@@ -249,12 +375,12 @@ def main():
 
     try:
         
-        if NODE_ID == 0: 
+        if NODE_ID == 1: 
             tx_radio = setup_radios(MODULE0, FREQUENCY0, NODE_ID, NETWORK_ID, 16, 15, 0, 0) 
             rx_radio = setup_radios(MODULE1, FREQUENCY1, NODE_ID, NETWORK_ID, 18, 22, 0, 1)
-        if NODE_ID == 1:
-            tx_radio = setup_radios(MODULE1, FREQUENCY1, NODE_ID, NETWORK_ID, 16, 15, 0, 0) 
-            rx_radio = setup_radios(MODULE0, FREQUENCY0, NODE_ID, NETWORK_ID, 18, 22, 0, 1)
+        if NODE_ID == 2:
+            rx_radio = setup_radios(MODULE0, FREQUENCY0, NODE_ID, NETWORK_ID, 16, 15, 0, 0) 
+            tx_radio = setup_radios(MODULE1, FREQUENCY1, NODE_ID, NETWORK_ID, 18, 22, 0, 1)
 
         while True:
 
@@ -263,6 +389,12 @@ def main():
                 pass
             else:
                 send_packet(pkt, tx_radio, OTHERNODE, chunk_size=60)
+
+            receive_packet_reassemble(rx_radio)
+
+            # Small sleep to prevent CPU spinning
+            time.sleep(TOSLEEP)
+
 
     except:
         print("Shutting down RFM69 modules")

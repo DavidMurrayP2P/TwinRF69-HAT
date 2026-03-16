@@ -158,7 +158,7 @@ def read_tun_nonblocking(tun: Union[IO, int], bufsize: int = 4096) -> Optional[b
             return None
         raise
 
-def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: float = 0.16) -> None:
+def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: float = 0.1) -> None:
     """
     Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks.
 
@@ -221,102 +221,6 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: 
     except Exception as e:
         print(f"send_packet: error while sending: {e}")
         raise
-
-def receive_packet_reassemble(radio_rx):
-    """
-    Non-blocking receive that reassembles fragmented packets.
-    Expects SEQ to start at 1 (not 0) to match fixed sender.
-    """
-    global _rx_buffers, _rx_timestamps
-    
-    if not radio_rx.receiveDone():
-        return
-    
-    sender_id = radio_rx.SENDERID
-    rssi = radio_rx.RSSI
-    data = radio_rx.DATA
-    
-    if isinstance(data, (list, tuple)):
-        data_bytes = bytes(data)
-    else:
-        data_bytes = data
-    
-    print(f"[RX RAW] {sender_id}: RSSI={rssi} raw_len={len(data_bytes)}")
-    
-    if len(data_bytes) < 4:
-        radio_rx.receiveBegin()
-        return
-    
-    try:
-        msgid, seq = struct.unpack(">HH", data_bytes[:4])
-        chunk = data_bytes[4:]
-    except Exception as e:
-        print(f"[RX ERROR] Failed to parse header: {e}")
-        radio_rx.receiveBegin()
-        return
-    
-    current_time = time.time()
-    msg_key = (sender_id, msgid)
-    
-    # Clean up old messages
-    expired_keys = [key for key, ts in _rx_timestamps.items() if current_time - ts > 10.0]
-    for key in expired_keys:
-        _rx_buffers.pop(key, None)
-        _rx_timestamps.pop(key, None)
-    
-    if msg_key not in _rx_buffers:
-        _rx_buffers[msg_key] = {}
-        _rx_timestamps[msg_key] = current_time
-    
-    if seq == 0xFFFF:
-        # END marker received
-        print(f"[RX END] {sender_id}: msgid={msgid}")
-        
-        if len(chunk) < 4:
-            _rx_buffers.pop(msg_key, None)
-            _rx_timestamps.pop(msg_key, None)
-            radio_rx.receiveBegin()
-            return
-        
-        try:
-            total_chunks, orig_len = struct.unpack(">HH", chunk[:4])
-        except Exception as e:
-            _rx_buffers.pop(msg_key, None)
-            _rx_timestamps.pop(msg_key, None)
-            radio_rx.receiveBegin()
-            return
-        
-        chunks_received = len(_rx_buffers[msg_key])
-        received_seqs = sorted(_rx_buffers[msg_key].keys())
-        
-        print(f"[RX DEBUG] {sender_id}: msgid={msgid} received {chunks_received}/{total_chunks} chunks: {received_seqs}")
-        
-        if chunks_received != total_chunks:
-            print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")
-            _rx_buffers.pop(msg_key, None)
-            _rx_timestamps.pop(msg_key, None)
-            radio_rx.receiveBegin()
-            return
-        
-        # Reassemble chunks in order (seq starts at 1, not 0)
-        reassembled = b''
-        for i in range(1, total_chunks + 1):  # 1..total_chunks
-            reassembled += _rx_buffers[msg_key][i]
-        
-        reassembled = reassembled[:orig_len]
-        
-        print(f"[RX COMPLETE] {sender_id}: msgid={msgid} reassembled {len(reassembled)} bytes")
-        print(f"[RX DATA] {reassembled}")
-        
-        _rx_buffers.pop(msg_key, None)
-        _rx_timestamps.pop(msg_key, None)
-    
-    else:
-        # Data chunk
-        _rx_buffers[msg_key][seq] = chunk
-        print(f"[RX CHUNK] {sender_id}: msgid={msgid} seq={seq} chunk_len={len(chunk)}")
-    
-    radio_rx.receiveBegin()
 
 def receive_packet_reassemble(radio_rx):
     """

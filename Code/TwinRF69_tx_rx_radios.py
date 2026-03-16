@@ -158,7 +158,7 @@ def read_tun_nonblocking(tun: Union[IO, int], bufsize: int = 4096) -> Optional[b
             return None
         raise
 
-def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: float = TOSLEEP) -> None:
+def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: float = 0.16) -> None:
     """
     Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks.
 
@@ -203,7 +203,7 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: 
                 radio.send(OTHERNODE, list(payload))
 
             print(f"TX >> {OTHERNODE}: msgid={msgid} seq={actual_seq}/{total_chunks} chunk_len={len(chunk)}")
-            time.sleep(TOSLEEP)
+            time.sleep(pause)
 
         # send END marker with total_chunks and original length (both uint16 BE)
         end_header = struct.pack(">HH", msgid, 0xFFFF)
@@ -221,9 +221,6 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: 
     except Exception as e:
         print(f"send_packet: error while sending: {e}")
         raise
-
-_rx_buffers = {}
-_rx_timestamps = {}
 
 def receive_packet_reassemble(radio_rx):
     """

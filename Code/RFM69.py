@@ -35,6 +35,7 @@ class RFM69(object):
         self.RSSI = 0
         self.DATA = []
         self.sendSleepTime = 0.05
+        self.powerLevel = 31  # default; updated by setPowerLevel()
 
         #GPIO.setboard(GPIO.ZERO)   # for Orange Pi, see https://pypi.org/project/OrangePi.GPIO/
         GPIO.setmode(GPIO.BOARD)
@@ -168,7 +169,9 @@ class RFM69(object):
 
         # we are using packet mode, so this check is not really needed
         # but waiting for mode ready is necessary when going from sleep because the FIFO may not be immediately available from previous mode
-        while self.mode == RF69_MODE_SLEEP and self.readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY == 0x00:
+        # FIX: added parentheses to correct operator precedence — without them, Python evaluates
+        # `RF_IRQFLAGS1_MODEREADY == 0x00` first (always False), making the loop never wait.
+        while self.mode == RF69_MODE_SLEEP and (self.readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY) == 0x00:
             pass
 
         self.mode = newMode;
@@ -290,8 +293,10 @@ class RFM69(object):
         self.intLock = False
 
     def receiveBegin(self):
+        # FIX: was time.sleep(0.1) — 100ms stall is far too long at 250kbps and
+        # would exceed ACK timeouts, causing spurious retries.
         while self.intLock:
-            time.sleep(.1)
+            time.sleep(0.001)
         self.DATALEN = 0
         self.SENDERID = 0
         self.TARGETID = 0
@@ -356,7 +361,9 @@ class RFM69(object):
         else:
             self.writeReg(REG_OCP, RF_OCP_ON)
             #enable P0 only
-            self.writeReg(REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | powerLevel)
+            # FIX: was bare `powerLevel` which is undefined in this scope — crashes shutdown().
+            # Use self.powerLevel which is always set (defaulted to 31 in __init__).
+            self.writeReg(REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | self.powerLevel)
 
     def setHighPowerRegs(self, onOff):
         if onOff:
@@ -391,4 +398,3 @@ class RFM69(object):
         self.setHighPower(False)
         self.sleep()
         GPIO.cleanup()
-

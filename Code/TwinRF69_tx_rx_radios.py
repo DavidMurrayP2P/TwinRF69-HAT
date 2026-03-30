@@ -246,7 +246,7 @@ def read_tun_nonblocking(tun: Union[IO, int], bufsize: int = 4096) -> Optional[b
             return None
         raise
 
-def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 60, pause: float = 0.1) -> None:
+def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: float = 0.1) -> None:
     """
     Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks.
 
@@ -447,7 +447,7 @@ def main():
             if pkt is None:
                 pass
             else:
-                send_packet(pkt, tx_radio, OTHERNODE, chunk_size=60, pause=0.3)
+                send_packet(pkt, tx_radio, OTHERNODE, chunk_size=55, pause=0.1)
 
 			# Non-blocking receive (packets from RX - write them to TUN)
             result = receive_packet_reassemble(rx_radio)

@@ -35,7 +35,6 @@ class RFM69(object):
         self.RSSI = 0
         self.DATA = []
         self.sendSleepTime = 0.05
-        self.powerLevel = 31  # default; updated by setPowerLevel()
 
         #GPIO.setboard(GPIO.ZERO)   # for Orange Pi, see https://pypi.org/project/OrangePi.GPIO/
         GPIO.setmode(GPIO.BOARD)
@@ -169,9 +168,7 @@ class RFM69(object):
 
         # we are using packet mode, so this check is not really needed
         # but waiting for mode ready is necessary when going from sleep because the FIFO may not be immediately available from previous mode
-        # FIX: added parentheses to correct operator precedence — without them, Python evaluates
-        # `RF_IRQFLAGS1_MODEREADY == 0x00` first (always False), making the loop never wait.
-        while self.mode == RF69_MODE_SLEEP and (self.readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY) == 0x00:
+        while self.mode == RF69_MODE_SLEEP and self.readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY == 0x00:
             pass
 
         self.mode = newMode;
@@ -208,6 +205,7 @@ class RFM69(object):
         now = time.time()
         while (not self.canSend()) and time.time() - now < RF69_CSMA_LIMIT_S:
             self.receiveDone()
+            time.sleep(0.001)
         self.sendFrame(toAddress, buff, requestACK, False)
 
 #    to increase the chance of getting a packet across, call this function instead of send
@@ -259,6 +257,10 @@ class RFM69(object):
             ack = 0x80
         elif requestACK:
             ack = 0x40
+
+        # Set DIO0 to PACKETSENT in TX mode
+        self.writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_00)
+
         if isinstance(buff, str):
             self.spi.xfer2([REG_FIFO | 0x80, len(buff) + 3, toAddress, self.address, ack] + [int(ord(i)) for i in list(buff)])
         else:
@@ -266,8 +268,12 @@ class RFM69(object):
 
         self.DATASENT = False
         self.setMode(RF69_MODE_TX)
-        while (self.readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PACKETSENT) == 0x00:
-            pass
+        # Sleep-poll instead of spinning — at 250 kbps a max packet takes ~2.5 ms
+        timeout = time.time() + 0.1  # 100ms safety timeout
+        while not self.DATASENT and (self.readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PACKETSENT) == 0x00:
+            if time.time() > timeout:
+                break
+            time.sleep(0.001)
         self.setMode(RF69_MODE_RX)
 
     def interruptHandler(self, pin):
@@ -293,10 +299,8 @@ class RFM69(object):
         self.intLock = False
 
     def receiveBegin(self):
-        # FIX: was time.sleep(0.1) — 100ms stall is far too long at 250kbps and
-        # would exceed ACK timeouts, causing spurious retries.
         while self.intLock:
-            time.sleep(0.001)
+            time.sleep(.1)
         self.DATALEN = 0
         self.SENDERID = 0
         self.TARGETID = 0
@@ -361,9 +365,7 @@ class RFM69(object):
         else:
             self.writeReg(REG_OCP, RF_OCP_ON)
             #enable P0 only
-            # FIX: was bare `powerLevel` which is undefined in this scope — crashes shutdown().
-            # Use self.powerLevel which is always set (defaulted to 31 in __init__).
-            self.writeReg(REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | self.powerLevel)
+            self.writeReg(REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | powerLevel)
 
     def setHighPowerRegs(self, onOff):
         if onOff:

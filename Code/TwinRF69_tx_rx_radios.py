@@ -115,45 +115,6 @@ def setup_radios(MODULE, FREQUENCY, NODE_ID, NETWORK_ID, INT_PIN, RST_PIN, SPI_B
 
     return radio
 
-def setup_radios1(MODULE, FREQUENCY, NODE_ID, NETWORK_ID, INT_PIN, RST_PIN, SPI_BUS, SPI_DEV):
-
-    # Initialize the 915MHz radio
-    radio = RFM69.RFM69(
-        freqBand=MODULE,  # Frequency band
-        nodeID=NODE_ID,           # Node ID
-        networkID=NETWORK_ID,         # Network ID5
-        isRFM69HW=True,        # High-power version flag
-        intPin=INT_PIN,             # Custom interrupt pin
-        rstPin=RST_PIN,             # Custom reset pin
-        spiBus=SPI_BUS,              # Custom SPI bus
-        spiDevice=SPI_DEV            # Custom SPI device
-    )
-
-    print("Class initialized")
-
-    print("Reading all registers")
-    results = radio.readAllRegs()
-    for result in results:
-        print(result)
-
-    print("Performing rcCalibration")
-    radio.rcCalibration()
-
-    print("Setting high power")
-    radio.setHighPower(True)
-    radio.setPowerLevel(31)
-
-    print("Checking temperature")
-    print(radio.readTemperature(0))
-
-    radio.setFrequency(FREQUENCY)
-    radio.writeReg(REG_BITRATEMSB, RF_BITRATEMSB_250000)
-    radio.writeReg(REG_BITRATELSB, RF_BITRATELSB_250000)
-    radio.writeReg(REG_FDEVMSB, RF_FDEVMSB_50000)
-    radio.writeReg(REG_FDEVLSB, RF_FDEVLSB_50000)
-
-    return(radio)
-
 def create_tun_for_node(node_id: int,
                         ifname: str = None,
                         network_base: str = "10.0.0",
@@ -246,7 +207,7 @@ def read_tun_nonblocking(tun: Union[IO, int], bufsize: int = 4096) -> Optional[b
             return None
         raise
 
-def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: float = 0.1) -> None:
+def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: float = TOSLEEP) -> None:
     """
     Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks.
 
@@ -427,8 +388,6 @@ def main():
     MODULE0 = RF69_433MHZ
     FREQUENCY0 = 433000000
 
-    packet_size = 62
-
     tun_file, ifname, ip = create_tun_for_node(NODE_ID)
     print(ifname, ip)
 
@@ -447,7 +406,7 @@ def main():
             if pkt is None:
                 pass
             else:
-                send_packet(pkt, tx_radio, OTHERNODE, chunk_size=55, pause=0.1)
+                send_packet(pkt, tx_radio, OTHERNODE, chunk_size=55)
 
 			# Non-blocking receive (packets from RX - write them to TUN)
             result = receive_packet_reassemble(rx_radio)

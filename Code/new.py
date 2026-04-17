@@ -96,12 +96,12 @@ def send_binary_over_radios(data_bytes, chunk_size, radio_tx):
             frame = hdr + c
             # radio.send accepts list-of-int in this repo; pass list(frame)
             radio_tx.send(OTHERNODE, list(frame))
-            time.sleep(0.06)
+            time.sleep(0.005)
         # send END marker with total and original length
         hdr = struct.pack('!H H', msgid, 0xFFFF)
         meta = struct.pack('!H H', total, len(data_bytes) if len(data_bytes) < 0xFFFF else 0xFFFF)
         radio_tx.send(OTHERNODE, list(hdr + meta))
-        time.sleep(0.06)
+        time.sleep(0.005)
     except KeyboardInterrupt:
         pass
     except Exception as e:
@@ -267,10 +267,51 @@ def setup_radios(MODULE, FREQUENCY, NODE_ID, NETWORK_ID, INT_PIN, RST_PIN, SPI_B
     radio.setHighPower(isHighPower)
     radio.setPowerLevel(31)
     radio.setFrequency(FREQUENCY)
+
+    # Bitrate: 250 kbps
     radio.writeReg(REG_BITRATEMSB, RF_BITRATEMSB_250000)
     radio.writeReg(REG_BITRATELSB, RF_BITRATELSB_250000)
-    radio.writeReg(REG_FDEVMSB, RF_FDEVMSB_50000)
-    radio.writeReg(REG_FDEVLSB, RF_FDEVLSB_50000)
+
+    # FIX 1 — Gaussian BT=0.5 shaping: tightens TX spectrum, improves sensitivity ~1-2 dB.
+    radio.writeReg(REG_DATAMODUL,
+                   RF_DATAMODUL_DATAMODE_PACKET |
+                   RF_DATAMODUL_MODULATIONTYPE_FSK |
+                   RF_DATAMODUL_MODULATIONSHAPING_01)
+
+    # FIX 2 — Fdev = 75 kHz: modulation index h = 2*75k/250k = 0.6 (must be >= 0.5).
+    # Previous RF_FDEVMSB/LSB_50000 gave h=0.4 — too low, partial eye closure.
+    # 75000 Hz / 61.03515625 Hz/step = 0x04D0
+    radio.writeReg(REG_FDEVMSB, 0x04)
+    radio.writeReg(REG_FDEVLSB, 0xD0)
+
+    # FIX 3 — RxBw = 200 kHz: must satisfy RxBw >= Fdev + BitRate/2 = 75k + 125k = 200 kHz.
+    # Library default was MANT_16|EXP_2 = 125 kHz — too narrow, the main cause of
+    # constant CRC failures and corrupted packets.
+    # MANT_20|EXP_1 -> 32e6 / (20 * 2 * 4) = 200 kHz.
+    radio.writeReg(REG_RXBW,
+                   RF_RXBW_DCCFREQ_010 |
+                   RF_RXBW_MANT_20 |
+                   RF_RXBW_EXP_1)
+
+    # FIX 4 — AfcBw = 400 kHz: AFC bandwidth must be wider than RxBw to lock on
+    # during the preamble. REG_AFCBW = 0x1A.
+    # MANT_20|EXP_0 -> 32e6 / (20 * 1 * 4) = 400 kHz.
+    radio.writeReg(0x1A,
+                   RF_RXBW_DCCFREQ_010 |
+                   RF_RXBW_MANT_20 |
+                   RF_RXBW_EXP_0)
+
+    # FIX 5 — DC-free whitening: prevents long 0/1 runs from drifting the receiver's
+    # DC baseline at 250 kbps.
+    radio.writeReg(REG_PACKETCONFIG1,
+                   RF_PACKET1_FORMAT_VARIABLE |
+                   RF_PACKET1_DCFREE_WHITENING |
+                   RF_PACKET1_CRC_ON |
+                   RF_PACKET1_CRCAUTOCLEAR_ON |
+                   RF_PACKET1_ADRSFILTERING_OFF)
+
+    radio.receiveBegin()
+    print(f"Radio ready: freq={FREQUENCY/1e6:.3f}MHz  Fdev=75kHz  RxBw=200kHz  AfcBw=400kHz  BR=250kbps")
     return radio
 
 def main():

@@ -282,10 +282,19 @@ def receive_packet_reassemble(radio_rx):
     if not radio_rx.receiveDone():
         return None
     
+    # Snapshot radio state into locals before anything else.
     sender_id = radio_rx.SENDERID
     rssi = radio_rx.RSSI
     data = radio_rx.DATA
-    
+
+    # Re-arm the receiver NOW — before any slow processing (prints, dict ops,
+    # etc.).  receiveDone() already put the radio into STANDBY; every millisecond
+    # we spend processing instead of calling receiveBegin() is a millisecond
+    # during which the next arriving chunk is dropped.  With TOSLEEP=5 ms
+    # between TX chunks the window matters: seq=2 routinely arrived while the
+    # old code was still printing seq=1's log lines.
+    radio_rx.receiveBegin()
+
     if isinstance(data, (list, tuple)):
         data_bytes = bytes(data)
     else:
@@ -294,7 +303,6 @@ def receive_packet_reassemble(radio_rx):
     print(f"[RX RAW] {sender_id}: RSSI={rssi} raw_len={len(data_bytes)}")
     
     if len(data_bytes) < 4:
-        radio_rx.receiveBegin()
         return None
     
     try:
@@ -302,7 +310,6 @@ def receive_packet_reassemble(radio_rx):
         chunk = data_bytes[4:]
     except Exception as e:
         print(f"[RX ERROR] Failed to parse header: {e}")
-        radio_rx.receiveBegin()
         return None
     
     current_time = time.time()
@@ -325,7 +332,6 @@ def receive_packet_reassemble(radio_rx):
         if len(chunk) < 4:
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
-            radio_rx.receiveBegin()
             return None
         
         try:
@@ -333,7 +339,6 @@ def receive_packet_reassemble(radio_rx):
         except Exception as e:
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
-            radio_rx.receiveBegin()
             return None
         
         chunks_received = len(_rx_buffers[msg_key])
@@ -345,7 +350,6 @@ def receive_packet_reassemble(radio_rx):
             print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
-            radio_rx.receiveBegin()
             return None
         
         # Reassemble chunks in order (seq starts at 1, not 0)
@@ -360,8 +364,6 @@ def receive_packet_reassemble(radio_rx):
         _rx_buffers.pop(msg_key, None)
         _rx_timestamps.pop(msg_key, None)
         
-        radio_rx.receiveBegin()
-        
         # Return the complete packet
         return (sender_id, reassembled)
     
@@ -369,7 +371,6 @@ def receive_packet_reassemble(radio_rx):
         # Data chunk
         _rx_buffers[msg_key][seq] = chunk
         print(f"[RX CHUNK] {sender_id}: msgid={msgid} seq={seq} chunk_len={len(chunk)}")
-        radio_rx.receiveBegin()
         return None
 
 def main():

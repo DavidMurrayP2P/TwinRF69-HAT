@@ -23,6 +23,11 @@ TIMEOUT = 1
 
 _rx_buffers = {}
 _rx_timestamps = {}
+_rx_nack_counts = {}  # (sender_id, msgid) -> int; tracks how many NACKs sent for a message
+
+ARQ_NACK_SEQ = 0xFFFD   # special SEQ value used in NACK frames
+ARQ_MAX_RETRIES = 3     # max number of NACK/retransmit cycles per message
+ARQ_NACK_TIMEOUT = 0.1  # seconds to wait for a NACK after sending END
 
 class RegionNotSetError(Exception):
     """Please set the appropriate region"""
@@ -210,28 +215,23 @@ def read_tun_nonblocking(tun: Union[IO, int], bufsize: int = 4096) -> Optional[b
 
 def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: float = TOSLEEP, rx_radio=None) -> None:
     """
-    Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks.
+    Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks with ARQ retry.
 
     Protocol:
       - Each payload = 4-byte header + chunk
       - Header = MSGID (uint16 BE), SEQ (uint16 BE)
       - SEQ 1..N = data chunks (starts at 1, not 0, to avoid RFM69 dropping first packet)
-      - SEQ == 0xFFFE = XOR parity chunk (FEC); allows recovery of any single lost data chunk.
+      - SEQ == 0xFFFD = NACK frame; payload is a list of missing seq numbers (uint8 each)
       - SEQ == 0xFFFF = END marker; its payload after header is two uint16 BE:
            total_chunks, orig_len
 
-    The parity chunk is the byte-wise XOR of all data chunks (shorter chunks are
-    zero-padded to chunk_size before XORing).  The receiver can reconstruct any one
-    missing data chunk as: missing = parity XOR (XOR of all other received chunks),
-    then truncated back to the correct length using orig_len.
+    ARQ: After sending END, if rx_radio is provided, the sender listens for a NACK from
+    the receiver.  A NACK lists which chunks were not received.  The sender retransmits
+    only those chunks and re-sends END.  This repeats up to ARQ_MAX_RETRIES times.
 
     Parameters:
-      rx_radio: If provided, this radio is muted to standby immediately before each
-                frame is transmitted and re-armed after TX completes.  Use this when
-                the TX and RX radios are physically close to each other (e.g. on the
-                same HAT) so that the TX burst cannot desensitise the RX front-end
-                and cause the RX radio to miss the chunk from the remote side that
-                arrives simultaneously.  Has no effect when rx_radio=None.
+      rx_radio: If provided, used for interference mitigation (muted to standby before
+                each TX frame, re-armed after) and to receive NACK frames for ARQ.
     """
 
     if not isinstance(pkt, (bytes, bytearray)):
@@ -252,6 +252,11 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
     total_len = len(pkt)
     total_chunks = (total_len + chunk_size - 1) // chunk_size
 
+    # Pre-compute all chunks indexed by 1-based seq number for easy retransmission.
+    chunk_data = {}
+    for seq in range(total_chunks):
+        chunk_data[seq + 1] = pkt[seq * chunk_size:(seq + 1) * chunk_size]
+
     def _radio_send(payload):
         if rx_radio is not None:
             rx_radio.setMode(RF69_MODE_STANDBY)
@@ -263,32 +268,52 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
             rx_radio.receiveBegin()
         time.sleep(pause)
 
-    try:
-        # Build and send all data chunks; accumulate XOR parity as we go.
-        parity = bytearray(chunk_size)
-        for seq in range(total_chunks):
-            start = seq * chunk_size
-            chunk = pkt[start:start + chunk_size]
-            # XOR chunk into parity (zero-pad short final chunk)
-            padded = chunk.ljust(chunk_size, b'\x00')
-            for i in range(chunk_size):
-                parity[i] ^= padded[i]
-
-            actual_seq = seq + 1  # SEQ starts at 1, not 0
+    def _send_chunks(seqs):
+        for actual_seq in seqs:
+            chunk = chunk_data[actual_seq]
             header = struct.pack(">HH", msgid, actual_seq)
             _radio_send(header + chunk)
-            print(f"TX > {OTHERNODE}: msgid={msgid} seq={actual_seq}/{total_chunks} chunk_len={len(chunk)}")
+            print(f"TX >> {OTHERNODE}: msgid={msgid} seq={actual_seq}/{total_chunks} chunk_len={len(chunk)}")
 
-        # Send FEC parity chunk (seq=0xFFFE)
-        parity_header = struct.pack(">HH", msgid, 0xFFFE)
-        _radio_send(parity_header + bytes(parity))
-        print(f"TX > {OTHERNODE}: msgid={msgid} PARITY chunk_len={chunk_size}")
-
-        # Send END marker (seq=0xFFFF)
+    def _send_end():
         end_header = struct.pack(">HH", msgid, 0xFFFF)
         end_payload = end_header + struct.pack(">HH", total_chunks & 0xFFFF, total_len & 0xFFFF)
         _radio_send(end_payload)
-        print(f"TX > {OTHERNODE}: msgid={msgid} END total_chunks={total_chunks} orig_len={total_len}")
+        print(f"TX >> {OTHERNODE}: msgid={msgid} END total_chunks={total_chunks} orig_len={total_len}")
+
+    try:
+        # Initial transmission: all chunks then END.
+        _send_chunks(sorted(chunk_data.keys()))
+        _send_end()
+
+        if rx_radio is None:
+            return
+
+        # ARQ: wait for NACK, retransmit missing chunks if requested.
+        for attempt in range(ARQ_MAX_RETRIES):
+            deadline = time.time() + ARQ_NACK_TIMEOUT
+            got_nack = False
+            while time.time() < deadline:
+                if rx_radio.receiveDone():
+                    raw = rx_radio.DATA
+                    if isinstance(raw, (list, tuple)):
+                        raw = bytes(raw)
+                    if len(raw) >= 4:
+                        recv_msgid, recv_seq = struct.unpack(">HH", raw[:4])
+                        if recv_msgid == msgid and recv_seq == ARQ_NACK_SEQ:
+                            missing = [s for s in raw[4:] if s in chunk_data]
+                            invalid = [s for s in raw[4:] if s not in chunk_data]
+                            if invalid:
+                                print(f"[TX ARQ] {OTHERNODE}: msgid={msgid} NACK contains unknown seqs={invalid}, ignoring them")
+                            if missing:
+                                print(f"[TX ARQ] {OTHERNODE}: msgid={msgid} NACK missing={missing} attempt={attempt + 1}/{ARQ_MAX_RETRIES}")
+                                _send_chunks(missing)
+                                _send_end()
+                                got_nack = True
+                                break
+                time.sleep(0.001)
+            if not got_nack:
+                break  # no NACK within timeout — receiver has everything
 
     except KeyboardInterrupt:
         print("send_packet: interrupted by user")
@@ -297,21 +322,18 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
         print(f"send_packet: error while sending: {e}")
         raise
 
-_rx_parity = {}  # (sender_id, msgid) -> bytearray of received parity chunk
-
-def receive_packet_reassemble(radio_rx):
+def receive_packet_reassemble(radio_rx, radio_tx=None, tx_target=None):
     """
     Non-blocking receive that reassembles fragmented packets.
     Returns (sender_id, reassembled_bytes) when complete, otherwise None.
 
-    FEC (Forward Error Correction):
-      The sender transmits an XOR parity chunk (seq=0xFFFE) after all data chunks.
-      If exactly one data chunk is missing when the END marker arrives, the receiver
-      reconstructs it as:  missing = parity XOR (XOR of all other received chunks).
-      This corrects any single lost chunk per message at the cost of one extra radio
-      frame per packet.
+    ARQ: If radio_tx and tx_target are provided, a NACK is sent back to the sender
+    when the END marker arrives but some chunks are still missing.  The NACK frame
+    (SEQ=0xFFFD) carries the list of missing seq numbers (uint8 each).  The sender
+    retransmits only those chunks and re-sends END.  Up to ARQ_MAX_RETRIES NACKs
+    are attempted before the incomplete message is discarded.
     """
-    global _rx_buffers, _rx_timestamps, _rx_parity
+    global _rx_buffers, _rx_timestamps, _rx_nack_counts
     
     if not radio_rx.receiveDone():
         return None
@@ -338,34 +360,32 @@ def receive_packet_reassemble(radio_rx):
         print(f"[RX ERROR] Failed to parse header: {e}")
         return None
 
+    # Ignore NACK frames — they are consumed by the sender side in send_packet.
+    if seq == ARQ_NACK_SEQ:
+        return None
+
     # Reject packets whose sequence number is impossible for this protocol.
-    # Valid data chunks have seq in 1..255; parity uses 0xFFFE; END uses 0xFFFF.
+    # Valid data chunks have seq in 1..255; the END marker uses seq=0xFFFF.
     # Ghost/corrupt packets that slip past the hardware CRC consistently show
     # seq == msgid at values like 2827, 8738, or 16448 — far outside this range.
-    if seq not in (0xFFFE, 0xFFFF) and (seq == 0 or seq > 255):
+    if seq != 0xFFFF and (seq == 0 or seq > 255):
         print(f"[RX DISCARD] {sender_id}: msgid={msgid} seq={seq} out of range, discarding")
         return None
 
     current_time = time.time()
     msg_key = (sender_id, msgid)
     
-    # Clean up old messages (data buffers and parity)
+    # Clean up old messages
     expired_keys = [key for key, ts in _rx_timestamps.items() if current_time - ts > 10.0]
     for key in expired_keys:
         _rx_buffers.pop(key, None)
         _rx_timestamps.pop(key, None)
-        _rx_parity.pop(key, None)
+        _rx_nack_counts.pop(key, None)
     
     if msg_key not in _rx_buffers:
         _rx_buffers[msg_key] = {}
         _rx_timestamps[msg_key] = current_time
-
-    if seq == 0xFFFE:
-        # FEC parity chunk
-        _rx_parity[msg_key] = bytearray(chunk)
-        print(f"[RX PARITY] {sender_id}: msgid={msgid} parity_len={len(chunk)}")
-        return None
-
+    
     if seq == 0xFFFF:
         # END marker received
         print(f"[RX END] {sender_id}: msgid={msgid}")
@@ -373,7 +393,7 @@ def receive_packet_reassemble(radio_rx):
         if len(chunk) < 4:
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
-            _rx_parity.pop(msg_key, None)
+            _rx_nack_counts.pop(msg_key, None)
             return None
         
         try:
@@ -381,7 +401,7 @@ def receive_packet_reassemble(radio_rx):
         except Exception:
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
-            _rx_parity.pop(msg_key, None)
+            _rx_nack_counts.pop(msg_key, None)
             return None
         
         buf = _rx_buffers[msg_key]
@@ -390,33 +410,30 @@ def receive_packet_reassemble(radio_rx):
         
         print(f"[RX DEBUG] {sender_id}: msgid={msgid} received {chunks_received}/{total_chunks} chunks: {received_seqs}")
         
-        if chunks_received == total_chunks - 1 and msg_key in _rx_parity:
-            # Exactly one data chunk is missing — attempt FEC recovery.
-            missing_seq = next((i for i in range(1, total_chunks + 1) if i not in buf), None)
-            if missing_seq is not None:
-                parity = bytearray(_rx_parity[msg_key])
-                parity_len = len(parity)
-                # XOR parity with every received chunk (zero-padded to parity_len)
-                for s, c in buf.items():
-                    padded = c.ljust(parity_len, b'\x00')
-                    for i in range(parity_len):
-                        parity[i] ^= padded[i]
-                # parity now holds the recovered missing chunk; truncate the final
-                # chunk to its correct length so reassembly[:orig_len] stays exact.
-                if missing_seq == total_chunks:
-                    last_chunk_len = orig_len - (total_chunks - 1) * parity_len
-                    buf[missing_seq] = bytes(parity[:last_chunk_len])
-                else:
-                    buf[missing_seq] = bytes(parity)
-                chunks_received += 1
-                print(f"[RX FEC] {sender_id}: msgid={msgid} recovered missing seq={missing_seq}")
-
         if chunks_received != total_chunks:
-            print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")
-            _rx_buffers.pop(msg_key, None)
-            _rx_timestamps.pop(msg_key, None)
-            _rx_parity.pop(msg_key, None)
-            return None
+            # Some chunks are missing — send a NACK if ARQ is enabled.
+            missing = [s for s in range(1, total_chunks + 1) if s not in buf]
+            nack_count = _rx_nack_counts.get(msg_key, 0)
+            if radio_tx is not None and tx_target is not None and nack_count < ARQ_MAX_RETRIES:
+                _rx_nack_counts[msg_key] = nack_count + 1
+                nack_header = struct.pack(">HH", msgid, ARQ_NACK_SEQ)
+                nack_payload = nack_header + bytes(missing)
+                print(f"[ARQ NACK] -> {tx_target}: msgid={msgid} missing={missing} (attempt {nack_count + 1}/{ARQ_MAX_RETRIES})")
+                # Mute RX during NACK transmission to avoid self-interference.
+                radio_rx.setMode(RF69_MODE_STANDBY)
+                try:
+                    radio_tx.send(tx_target, nack_payload)
+                except TypeError:
+                    radio_tx.send(tx_target, list(nack_payload))
+                radio_rx.receiveBegin()
+                # Keep the partial buffer and wait for retransmitted chunks.
+                return None
+            else:
+                print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")
+                _rx_buffers.pop(msg_key, None)
+                _rx_timestamps.pop(msg_key, None)
+                _rx_nack_counts.pop(msg_key, None)
+                return None
         
         # Reassemble chunks in order (seq starts at 1, not 0)
         reassembled = b''
@@ -429,7 +446,7 @@ def receive_packet_reassemble(radio_rx):
         
         _rx_buffers.pop(msg_key, None)
         _rx_timestamps.pop(msg_key, None)
-        _rx_parity.pop(msg_key, None)
+        _rx_nack_counts.pop(msg_key, None)
         
         # Return the complete packet
         return (sender_id, reassembled)
@@ -487,7 +504,7 @@ def main():
                     send_packet(pkt, tx_radio, OTHERNODE, chunk_size=57, rx_radio=rx_radio)
 
             # Non-blocking receive (packets from RX - write them to TUN)
-            result = receive_packet_reassemble(rx_radio)
+            result = receive_packet_reassemble(rx_radio, radio_tx=tx_radio, tx_target=OTHERNODE)
             if result is not None:
                 sender_id, reassembled_pkt = result
                 try:

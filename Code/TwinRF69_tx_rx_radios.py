@@ -208,7 +208,7 @@ def read_tun_nonblocking(tun: Union[IO, int], bufsize: int = 4096) -> Optional[b
             return None
         raise
 
-def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: float = TOSLEEP) -> None:
+def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: float = TOSLEEP, rx_radio=None) -> None:
     """
     Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks.
 
@@ -218,6 +218,14 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
       - SEQ 1..N = data chunks (starts at 1, not 0, to avoid RFM69 dropping first packet)
       - SEQ == 0xFFFF = END marker; its payload after header is two uint16 BE:
            total_chunks, orig_len
+
+    Parameters:
+      rx_radio: If provided, this radio is muted to standby immediately before each
+                frame is transmitted and re-armed after TX completes.  Use this when
+                the TX and RX radios are physically close to each other (e.g. on the
+                same HAT) so that the TX burst cannot desensitise the RX front-end
+                and cause the RX radio to miss the chunk from the remote side that
+                arrives simultaneously.
     """
 
     if not isinstance(pkt, (bytes, bytearray)):
@@ -247,10 +255,14 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
             header = struct.pack(">HH", msgid, actual_seq)  # MSGID, SEQ
             payload = header + chunk
 
+            if rx_radio is not None:
+                rx_radio.setMode(RF69_MODE_STANDBY)
             try:
                 radio.send(OTHERNODE, payload)
             except TypeError:
                 radio.send(OTHERNODE, list(payload))
+            if rx_radio is not None:
+                rx_radio.receiveBegin()
 
             print(f"TX >> {OTHERNODE}: msgid={msgid} seq={actual_seq}/{total_chunks} chunk_len={len(chunk)}")
             time.sleep(pause)
@@ -258,10 +270,14 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
         # send END marker with total_chunks and original length (both uint16 BE)
         end_header = struct.pack(">HH", msgid, 0xFFFF)
         end_payload = end_header + struct.pack(">HH", total_chunks & 0xFFFF, total_len & 0xFFFF)
+        if rx_radio is not None:
+            rx_radio.setMode(RF69_MODE_STANDBY)
         try:
             radio.send(OTHERNODE, end_payload)
         except TypeError:
             radio.send(OTHERNODE, list(end_payload))
+        if rx_radio is not None:
+            rx_radio.receiveBegin()
 
         print(f"TX >> {OTHERNODE}: msgid={msgid} END total_chunks={total_chunks} orig_len={total_len}")
 
@@ -416,7 +432,7 @@ def main():
             if r:
                 pkt = read_tun_nonblocking(tun_file)
                 if pkt is not None:
-                    send_packet(pkt, tx_radio, OTHERNODE, chunk_size=57)
+                    send_packet(pkt, tx_radio, OTHERNODE, chunk_size=57, rx_radio=rx_radio)
 
             # Non-blocking receive (packets from RX - write them to TUN)
             result = receive_packet_reassemble(rx_radio)

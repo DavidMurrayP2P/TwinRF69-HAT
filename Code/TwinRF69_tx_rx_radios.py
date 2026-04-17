@@ -282,18 +282,10 @@ def receive_packet_reassemble(radio_rx):
     if not radio_rx.receiveDone():
         return None
     
-    # Snapshot radio state into locals before anything else.
+    # Snapshot radio state into locals before any slow processing.
     sender_id = radio_rx.SENDERID
     rssi = radio_rx.RSSI
     data = radio_rx.DATA
-
-    # Re-arm the receiver NOW — before any slow processing (prints, dict ops,
-    # etc.).  receiveDone() already put the radio into STANDBY; every millisecond
-    # we spend processing instead of calling receiveBegin() is a millisecond
-    # during which the next arriving chunk is dropped.  With TOSLEEP=5 ms
-    # between TX chunks the window matters: seq=2 routinely arrived while the
-    # old code was still printing seq=1's log lines.
-    radio_rx.receiveBegin()
 
     if isinstance(data, (list, tuple)):
         data_bytes = bytes(data)

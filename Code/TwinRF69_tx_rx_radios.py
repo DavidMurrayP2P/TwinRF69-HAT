@@ -266,11 +266,9 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
     try:
         # Build and send all data chunks; accumulate XOR parity as we go.
         parity = bytearray(chunk_size)
-        chunks = []
         for seq in range(total_chunks):
             start = seq * chunk_size
             chunk = pkt[start:start + chunk_size]
-            chunks.append(chunk)
             # XOR chunk into parity (zero-pad short final chunk)
             padded = chunk.ljust(chunk_size, b'\x00')
             for i in range(chunk_size):
@@ -394,18 +392,24 @@ def receive_packet_reassemble(radio_rx):
         
         if chunks_received == total_chunks - 1 and msg_key in _rx_parity:
             # Exactly one data chunk is missing — attempt FEC recovery.
-            missing_seq = next(i for i in range(1, total_chunks + 1) if i not in buf)
-            parity = bytearray(_rx_parity[msg_key])
-            parity_len = len(parity)
-            # XOR parity with every received chunk (zero-padded to parity_len)
-            for s, c in buf.items():
-                padded = c.ljust(parity_len, b'\x00')
-                for i in range(parity_len):
-                    parity[i] ^= padded[i]
-            # parity now holds the recovered missing chunk
-            buf[missing_seq] = bytes(parity)
-            chunks_received += 1
-            print(f"[RX FEC] {sender_id}: msgid={msgid} recovered missing seq={missing_seq}")
+            missing_seq = next((i for i in range(1, total_chunks + 1) if i not in buf), None)
+            if missing_seq is not None:
+                parity = bytearray(_rx_parity[msg_key])
+                parity_len = len(parity)
+                # XOR parity with every received chunk (zero-padded to parity_len)
+                for s, c in buf.items():
+                    padded = c.ljust(parity_len, b'\x00')
+                    for i in range(parity_len):
+                        parity[i] ^= padded[i]
+                # parity now holds the recovered missing chunk; truncate the final
+                # chunk to its correct length so reassembly[:orig_len] stays exact.
+                if missing_seq == total_chunks:
+                    last_chunk_len = orig_len - (total_chunks - 1) * parity_len
+                    buf[missing_seq] = bytes(parity[:last_chunk_len])
+                else:
+                    buf[missing_seq] = bytes(parity)
+                chunks_received += 1
+                print(f"[RX FEC] {sender_id}: msgid={msgid} recovered missing seq={missing_seq}")
 
         if chunks_received != total_chunks:
             print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")

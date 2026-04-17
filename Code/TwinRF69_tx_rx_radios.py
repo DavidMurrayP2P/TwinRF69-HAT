@@ -225,7 +225,7 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
                 the TX and RX radios are physically close to each other (e.g. on the
                 same HAT) so that the TX burst cannot desensitise the RX front-end
                 and cause the RX radio to miss the chunk from the remote side that
-                arrives simultaneously.
+                arrives simultaneously.  Has no effect when rx_radio=None.
     """
 
     if not isinstance(pkt, (bytes, bytearray)):

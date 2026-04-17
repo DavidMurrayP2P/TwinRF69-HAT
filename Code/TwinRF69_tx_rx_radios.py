@@ -216,8 +216,14 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
       - Each payload = 4-byte header + chunk
       - Header = MSGID (uint16 BE), SEQ (uint16 BE)
       - SEQ 1..N = data chunks (starts at 1, not 0, to avoid RFM69 dropping first packet)
+      - SEQ == 0xFFFE = XOR parity chunk (FEC); allows recovery of any single lost data chunk.
       - SEQ == 0xFFFF = END marker; its payload after header is two uint16 BE:
            total_chunks, orig_len
+
+    The parity chunk is the byte-wise XOR of all data chunks (shorter chunks are
+    zero-padded to chunk_size before XORing).  The receiver can reconstruct any one
+    missing data chunk as: missing = parity XOR (XOR of all other received chunks),
+    then truncated back to the correct length using orig_len.
 
     Parameters:
       rx_radio: If provided, this radio is muted to standby immediately before each
@@ -246,40 +252,43 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
     total_len = len(pkt)
     total_chunks = (total_len + chunk_size - 1) // chunk_size
 
-    try:
-        for seq in range(total_chunks):
-            start = seq * chunk_size
-            chunk = pkt[start:start + chunk_size]
-            # Use seq+1 so sequence numbers start at 1, not 0 (avoids RFM69 dropping first packet)
-            actual_seq = seq + 1
-            header = struct.pack(">HH", msgid, actual_seq)  # MSGID, SEQ
-            payload = header + chunk
-
-            if rx_radio is not None:
-                rx_radio.setMode(RF69_MODE_STANDBY)
-            try:
-                radio.send(OTHERNODE, payload)
-            except TypeError:
-                radio.send(OTHERNODE, list(payload))
-            if rx_radio is not None:
-                rx_radio.receiveBegin()
-
-            print(f"TX >> {OTHERNODE}: msgid={msgid} seq={actual_seq}/{total_chunks} chunk_len={len(chunk)}")
-            time.sleep(pause)
-
-        # send END marker with total_chunks and original length (both uint16 BE)
-        end_header = struct.pack(">HH", msgid, 0xFFFF)
-        end_payload = end_header + struct.pack(">HH", total_chunks & 0xFFFF, total_len & 0xFFFF)
+    def _radio_send(payload):
         if rx_radio is not None:
             rx_radio.setMode(RF69_MODE_STANDBY)
         try:
-            radio.send(OTHERNODE, end_payload)
+            radio.send(OTHERNODE, payload)
         except TypeError:
-            radio.send(OTHERNODE, list(end_payload))
+            radio.send(OTHERNODE, list(payload))
         if rx_radio is not None:
             rx_radio.receiveBegin()
+        time.sleep(pause)
 
-        print(f"TX >> {OTHERNODE}: msgid={msgid} END total_chunks={total_chunks} orig_len={total_len}")
+    try:
+        # Build and send all data chunks; accumulate XOR parity as we go.
+        parity = bytearray(chunk_size)
+        for seq in range(total_chunks):
+            start = seq * chunk_size
+            chunk = pkt[start:start + chunk_size]
+            # XOR chunk into parity (zero-pad short final chunk)
+            padded = chunk.ljust(chunk_size, b'\x00')
+            for i in range(chunk_size):
+                parity[i] ^= padded[i]
+
+            actual_seq = seq + 1  # SEQ starts at 1, not 0
+            header = struct.pack(">HH", msgid, actual_seq)
+            _radio_send(header + chunk)
+            print(f"TX > {OTHERNODE}: msgid={msgid} seq={actual_seq}/{total_chunks} chunk_len={len(chunk)}")
+
+        # Send FEC parity chunk (seq=0xFFFE)
+        parity_header = struct.pack(">HH", msgid, 0xFFFE)
+        _radio_send(parity_header + bytes(parity))
+        print(f"TX > {OTHERNODE}: msgid={msgid} PARITY chunk_len={chunk_size}")
+
+        # Send END marker (seq=0xFFFF)
+        end_header = struct.pack(">HH", msgid, 0xFFFF)
+        end_payload = end_header + struct.pack(">HH", total_chunks & 0xFFFF, total_len & 0xFFFF)
+        _radio_send(end_payload)
+        print(f"TX > {OTHERNODE}: msgid={msgid} END total_chunks={total_chunks} orig_len={total_len}")
 
     except KeyboardInterrupt:
         print("send_packet: interrupted by user")
@@ -288,12 +297,21 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
         print(f"send_packet: error while sending: {e}")
         raise
 
+_rx_parity = {}  # (sender_id, msgid) -> bytearray of received parity chunk
+
 def receive_packet_reassemble(radio_rx):
     """
     Non-blocking receive that reassembles fragmented packets.
     Returns (sender_id, reassembled_bytes) when complete, otherwise None.
+
+    FEC (Forward Error Correction):
+      The sender transmits an XOR parity chunk (seq=0xFFFE) after all data chunks.
+      If exactly one data chunk is missing when the END marker arrives, the receiver
+      reconstructs it as:  missing = parity XOR (XOR of all other received chunks).
+      This corrects any single lost chunk per message at the cost of one extra radio
+      frame per packet.
     """
-    global _rx_buffers, _rx_timestamps
+    global _rx_buffers, _rx_timestamps, _rx_parity
     
     if not radio_rx.receiveDone():
         return None
@@ -321,26 +339,33 @@ def receive_packet_reassemble(radio_rx):
         return None
 
     # Reject packets whose sequence number is impossible for this protocol.
-    # Valid data chunks have seq in 1..255; the END marker uses seq=0xFFFF.
+    # Valid data chunks have seq in 1..255; parity uses 0xFFFE; END uses 0xFFFF.
     # Ghost/corrupt packets that slip past the hardware CRC consistently show
     # seq == msgid at values like 2827, 8738, or 16448 — far outside this range.
-    if seq != 0xFFFF and (seq == 0 or seq > 255):
+    if seq not in (0xFFFE, 0xFFFF) and (seq == 0 or seq > 255):
         print(f"[RX DISCARD] {sender_id}: msgid={msgid} seq={seq} out of range, discarding")
         return None
 
     current_time = time.time()
     msg_key = (sender_id, msgid)
     
-    # Clean up old messages
+    # Clean up old messages (data buffers and parity)
     expired_keys = [key for key, ts in _rx_timestamps.items() if current_time - ts > 10.0]
     for key in expired_keys:
         _rx_buffers.pop(key, None)
         _rx_timestamps.pop(key, None)
+        _rx_parity.pop(key, None)
     
     if msg_key not in _rx_buffers:
         _rx_buffers[msg_key] = {}
         _rx_timestamps[msg_key] = current_time
-    
+
+    if seq == 0xFFFE:
+        # FEC parity chunk
+        _rx_parity[msg_key] = bytearray(chunk)
+        print(f"[RX PARITY] {sender_id}: msgid={msgid} parity_len={len(chunk)}")
+        return None
+
     if seq == 0xFFFF:
         # END marker received
         print(f"[RX END] {sender_id}: msgid={msgid}")
@@ -348,30 +373,55 @@ def receive_packet_reassemble(radio_rx):
         if len(chunk) < 4:
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
+            _rx_parity.pop(msg_key, None)
             return None
         
         try:
             total_chunks, orig_len = struct.unpack(">HH", chunk[:4])
-        except Exception as e:
+        except Exception:
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
+            _rx_parity.pop(msg_key, None)
             return None
         
-        chunks_received = len(_rx_buffers[msg_key])
-        received_seqs = sorted(_rx_buffers[msg_key].keys())
+        buf = _rx_buffers[msg_key]
+        chunks_received = len(buf)
+        received_seqs = sorted(buf.keys())
         
         print(f"[RX DEBUG] {sender_id}: msgid={msgid} received {chunks_received}/{total_chunks} chunks: {received_seqs}")
         
+        if chunks_received == total_chunks - 1 and msg_key in _rx_parity:
+            # Exactly one data chunk is missing — attempt FEC recovery.
+            missing_seq = next((i for i in range(1, total_chunks + 1) if i not in buf), None)
+            if missing_seq is not None:
+                parity = bytearray(_rx_parity[msg_key])
+                parity_len = len(parity)
+                # XOR parity with every received chunk (zero-padded to parity_len)
+                for s, c in buf.items():
+                    padded = c.ljust(parity_len, b'\x00')
+                    for i in range(parity_len):
+                        parity[i] ^= padded[i]
+                # parity now holds the recovered missing chunk; truncate the final
+                # chunk to its correct length so reassembly[:orig_len] stays exact.
+                if missing_seq == total_chunks:
+                    last_chunk_len = orig_len - (total_chunks - 1) * parity_len
+                    buf[missing_seq] = bytes(parity[:last_chunk_len])
+                else:
+                    buf[missing_seq] = bytes(parity)
+                chunks_received += 1
+                print(f"[RX FEC] {sender_id}: msgid={msgid} recovered missing seq={missing_seq}")
+
         if chunks_received != total_chunks:
             print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
+            _rx_parity.pop(msg_key, None)
             return None
         
         # Reassemble chunks in order (seq starts at 1, not 0)
         reassembled = b''
         for i in range(1, total_chunks + 1):
-            reassembled += _rx_buffers[msg_key][i]
+            reassembled += buf[i]
         
         reassembled = reassembled[:orig_len]
         
@@ -379,13 +429,15 @@ def receive_packet_reassemble(radio_rx):
         
         _rx_buffers.pop(msg_key, None)
         _rx_timestamps.pop(msg_key, None)
+        _rx_parity.pop(msg_key, None)
         
         # Return the complete packet
         return (sender_id, reassembled)
     
     else:
         # Data chunk
-        _rx_buffers[msg_key][seq] = chunk
+        buf = _rx_buffers[msg_key]
+        buf[seq] = chunk
         print(f"[RX CHUNK] {sender_id}: msgid={msgid} seq={seq} chunk_len={len(chunk)}")
         return None
 

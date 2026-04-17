@@ -303,7 +303,15 @@ def receive_packet_reassemble(radio_rx):
     except Exception as e:
         print(f"[RX ERROR] Failed to parse header: {e}")
         return None
-    
+
+    # Reject packets whose sequence number is impossible for this protocol.
+    # Valid data chunks have seq in 1..255; the END marker uses seq=0xFFFF.
+    # Ghost/corrupt packets that slip past the hardware CRC consistently show
+    # seq == msgid at values like 2827, 8738, or 16448 — far outside this range.
+    if seq != 0xFFFF and (seq == 0 or seq > 255):
+        print(f"[RX DISCARD] {sender_id}: msgid={msgid} seq={seq} out of range, discarding")
+        return None
+
     current_time = time.time()
     msg_key = (sender_id, msgid)
     

@@ -6,6 +6,7 @@ import time
 import RPi.GPIO as GPIO
 import os
 import fcntl
+import select
 import struct
 import subprocess
 from typing import Optional, Union, IO
@@ -17,7 +18,7 @@ REGION = 1 # Set to 1 for 433/915 and 2 for 433/868
 NODE_ID = 1 #Set this to an integer between 0 and 9
 OTHERNODE = 2
 NETWORK_ID = 0
-TOSLEEP = 0.064
+TOSLEEP = 0.005
 TIMEOUT = 1
 
 _rx_buffers = {}
@@ -170,7 +171,7 @@ def create_tun_for_node(node_id: int,
     # Use iptool to assign address and bring interface up. Use 'replace' to avoid errors if already present.
     subprocess.check_call(["ip", "addr", "replace", cidr, "dev", ifname])
     subprocess.check_call(["ip", "link", "set", "dev", ifname, "up"])
-    subprocess.check_call(["ip", "link", "set", "dev", ifname, "mtu", "256"])
+    subprocess.check_call(["ip", "link", "set", "dev", ifname, "mtu", "120"])
     
     return tun, ifname, ip_addr
 
@@ -401,14 +402,22 @@ def main():
             tx_radio = setup_radios(MODULE1, FREQUENCY1, NODE_ID, NETWORK_ID, 18, 22, 0, 1)
 
         while True:
+            # Use select() to wait up to 1 ms for TUN data before checking the RX radio.
+            # This avoids busy-polling and replaces the old time.sleep(TOSLEEP) idle loop.
+            #
+            # Throughput math (for reference):
+            #   RFM69 at 250 kbps: 61-byte max payload => ~3 ms air-time per frame.
+            #   4-byte fragmentation header => 57 bytes of user data per frame.
+            #   MTU=120 bytes => ceil(120/57)=3 data frames + 1 END = 4 radio TXs per IP packet.
+            #   TOSLEEP=0.005 s per frame => ~200 frames/s => ~11 kB/s (~88 kbps effective).
+            #   Old TOSLEEP=0.064 gave only ~860 B/s (~6.8 kbps) — a 13× slowdown.
+            r, _, _ = select.select([tun_file], [], [], 0.001)
+            if r:
+                pkt = read_tun_nonblocking(tun_file)
+                if pkt is not None:
+                    send_packet(pkt, tx_radio, OTHERNODE, chunk_size=57)
 
-            pkt = read_tun_nonblocking(tun_file)
-            if pkt is None:
-                pass
-            else:
-                send_packet(pkt, tx_radio, OTHERNODE, chunk_size=55)
-
-			# Non-blocking receive (packets from RX - write them to TUN)
+            # Non-blocking receive (packets from RX - write them to TUN)
             result = receive_packet_reassemble(rx_radio)
             if result is not None:
                 sender_id, reassembled_pkt = result
@@ -417,8 +426,6 @@ def main():
                     print(f"[TUN WRITE] Wrote {len(reassembled_pkt)} bytes from {sender_id}")
                 except OSError as e:
                     print(f"[TUN ERROR] Failed to write: {e}")
-
-            time.sleep(TOSLEEP)
 
     except:
         print("Shutting down RFM69 modules")

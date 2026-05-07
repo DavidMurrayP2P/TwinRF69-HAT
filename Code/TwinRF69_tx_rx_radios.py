@@ -6,7 +6,6 @@ import time
 import RPi.GPIO as GPIO
 import os
 import fcntl
-import select
 import struct
 import subprocess
 from typing import Optional, Union, IO
@@ -18,16 +17,11 @@ REGION = 1 # Set to 1 for 433/915 and 2 for 433/868
 NODE_ID = 1 #Set this to an integer between 0 and 9
 OTHERNODE = 2
 NETWORK_ID = 0
-TOSLEEP = 0.005
+TOSLEEP = 0.064
 TIMEOUT = 1
 
 _rx_buffers = {}
 _rx_timestamps = {}
-_rx_nack_counts = {}  # (sender_id, msgid) -> int; tracks how many NACKs sent for a message
-
-ARQ_NACK_SEQ = 0xFFFD   # special SEQ value used in NACK frames
-ARQ_MAX_RETRIES = 3     # max number of NACK/retransmit cycles per message
-ARQ_NACK_TIMEOUT = 0.1  # seconds to wait for a NACK after sending END
 
 class RegionNotSetError(Exception):
     """Please set the appropriate region"""
@@ -121,6 +115,45 @@ def setup_radios(MODULE, FREQUENCY, NODE_ID, NETWORK_ID, INT_PIN, RST_PIN, SPI_B
 
     return radio
 
+def setup_radios1(MODULE, FREQUENCY, NODE_ID, NETWORK_ID, INT_PIN, RST_PIN, SPI_BUS, SPI_DEV):
+
+    # Initialize the 915MHz radio
+    radio = RFM69.RFM69(
+        freqBand=MODULE,  # Frequency band
+        nodeID=NODE_ID,           # Node ID
+        networkID=NETWORK_ID,         # Network ID5
+        isRFM69HW=True,        # High-power version flag
+        intPin=INT_PIN,             # Custom interrupt pin
+        rstPin=RST_PIN,             # Custom reset pin
+        spiBus=SPI_BUS,              # Custom SPI bus
+        spiDevice=SPI_DEV            # Custom SPI device
+    )
+
+    print("Class initialized")
+
+    print("Reading all registers")
+    results = radio.readAllRegs()
+    for result in results:
+        print(result)
+
+    print("Performing rcCalibration")
+    radio.rcCalibration()
+
+    print("Setting high power")
+    radio.setHighPower(True)
+    radio.setPowerLevel(31)
+
+    print("Checking temperature")
+    print(radio.readTemperature(0))
+
+    radio.setFrequency(FREQUENCY)
+    radio.writeReg(REG_BITRATEMSB, RF_BITRATEMSB_250000)
+    radio.writeReg(REG_BITRATELSB, RF_BITRATELSB_250000)
+    radio.writeReg(REG_FDEVMSB, RF_FDEVMSB_50000)
+    radio.writeReg(REG_FDEVLSB, RF_FDEVLSB_50000)
+
+    return(radio)
+
 def create_tun_for_node(node_id: int,
                         ifname: str = None,
                         network_base: str = "10.0.0",
@@ -176,7 +209,7 @@ def create_tun_for_node(node_id: int,
     # Use iptool to assign address and bring interface up. Use 'replace' to avoid errors if already present.
     subprocess.check_call(["ip", "addr", "replace", cidr, "dev", ifname])
     subprocess.check_call(["ip", "link", "set", "dev", ifname, "up"])
-    subprocess.check_call(["ip", "link", "set", "dev", ifname, "mtu", "120"])
+    subprocess.check_call(["ip", "link", "set", "dev", ifname, "mtu", "256"])
     
     return tun, ifname, ip_addr
 
@@ -213,25 +246,16 @@ def read_tun_nonblocking(tun: Union[IO, int], bufsize: int = 4096) -> Optional[b
             return None
         raise
 
-def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: float = TOSLEEP, rx_radio=None) -> None:
+def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: float = 0.1) -> None:
     """
-    Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks with ARQ retry.
+    Send the given pkt (bytes) over `radio` to `OTHERNODE` in chunks.
 
     Protocol:
       - Each payload = 4-byte header + chunk
       - Header = MSGID (uint16 BE), SEQ (uint16 BE)
       - SEQ 1..N = data chunks (starts at 1, not 0, to avoid RFM69 dropping first packet)
-      - SEQ == 0xFFFD = NACK frame; payload is a list of missing seq numbers (uint8 each)
       - SEQ == 0xFFFF = END marker; its payload after header is two uint16 BE:
            total_chunks, orig_len
-
-    ARQ: After sending END, if rx_radio is provided, the sender listens for a NACK from
-    the receiver.  A NACK lists which chunks were not received.  The sender retransmits
-    only those chunks and re-sends END.  This repeats up to ARQ_MAX_RETRIES times.
-
-    Parameters:
-      rx_radio: If provided, used for interference mitigation (muted to standby before
-                each TX frame, re-armed after) and to receive NACK frames for ARQ.
     """
 
     if not isinstance(pkt, (bytes, bytearray)):
@@ -252,68 +276,32 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
     total_len = len(pkt)
     total_chunks = (total_len + chunk_size - 1) // chunk_size
 
-    # Pre-compute all chunks indexed by 1-based seq number for easy retransmission.
-    chunk_data = {}
-    for seq in range(total_chunks):
-        chunk_data[seq + 1] = pkt[seq * chunk_size:(seq + 1) * chunk_size]
+    try:
+        for seq in range(total_chunks):
+            start = seq * chunk_size
+            chunk = pkt[start:start + chunk_size]
+            # Use seq+1 so sequence numbers start at 1, not 0 (avoids RFM69 dropping first packet)
+            actual_seq = seq + 1
+            header = struct.pack(">HH", msgid, actual_seq)  # MSGID, SEQ
+            payload = header + chunk
 
-    def _radio_send(payload):
-        if rx_radio is not None:
-            rx_radio.setMode(RF69_MODE_STANDBY)
-        try:
-            radio.send(OTHERNODE, payload)
-        except TypeError:
-            radio.send(OTHERNODE, list(payload))
-        if rx_radio is not None:
-            rx_radio.receiveBegin()
-        time.sleep(pause)
+            try:
+                radio.send(OTHERNODE, payload)
+            except TypeError:
+                radio.send(OTHERNODE, list(payload))
 
-    def _send_chunks(seqs):
-        for actual_seq in seqs:
-            chunk = chunk_data[actual_seq]
-            header = struct.pack(">HH", msgid, actual_seq)
-            _radio_send(header + chunk)
             print(f"TX >> {OTHERNODE}: msgid={msgid} seq={actual_seq}/{total_chunks} chunk_len={len(chunk)}")
+            time.sleep(pause)
 
-    def _send_end():
+        # send END marker with total_chunks and original length (both uint16 BE)
         end_header = struct.pack(">HH", msgid, 0xFFFF)
         end_payload = end_header + struct.pack(">HH", total_chunks & 0xFFFF, total_len & 0xFFFF)
-        _radio_send(end_payload)
+        try:
+            radio.send(OTHERNODE, end_payload)
+        except TypeError:
+            radio.send(OTHERNODE, list(end_payload))
+
         print(f"TX >> {OTHERNODE}: msgid={msgid} END total_chunks={total_chunks} orig_len={total_len}")
-
-    try:
-        # Initial transmission: all chunks then END.
-        _send_chunks(sorted(chunk_data.keys()))
-        _send_end()
-
-        if rx_radio is None:
-            return
-
-        # ARQ: wait for NACK, retransmit missing chunks if requested.
-        for attempt in range(ARQ_MAX_RETRIES):
-            deadline = time.time() + ARQ_NACK_TIMEOUT
-            got_nack = False
-            while time.time() < deadline:
-                if rx_radio.receiveDone():
-                    raw = rx_radio.DATA
-                    if isinstance(raw, (list, tuple)):
-                        raw = bytes(raw)
-                    if len(raw) >= 4:
-                        recv_msgid, recv_seq = struct.unpack(">HH", raw[:4])
-                        if recv_msgid == msgid and recv_seq == ARQ_NACK_SEQ:
-                            missing = [s for s in raw[4:] if s in chunk_data]
-                            invalid = [s for s in raw[4:] if s not in chunk_data]
-                            if invalid:
-                                print(f"[TX ARQ] {OTHERNODE}: msgid={msgid} NACK contains unknown seqs={invalid}, ignoring them")
-                            if missing:
-                                print(f"[TX ARQ] {OTHERNODE}: msgid={msgid} NACK missing={missing} attempt={attempt + 1}/{ARQ_MAX_RETRIES}")
-                                _send_chunks(missing)
-                                _send_end()
-                                got_nack = True
-                                break
-                time.sleep(0.001)
-            if not got_nack:
-                break  # no NACK within timeout — receiver has everything
 
     except KeyboardInterrupt:
         print("send_packet: interrupted by user")
@@ -322,27 +310,20 @@ def send_packet(pkt: bytes, radio, OTHERNODE: int, chunk_size: int = 55, pause: 
         print(f"send_packet: error while sending: {e}")
         raise
 
-def receive_packet_reassemble(radio_rx, radio_tx=None, tx_target=None):
+def receive_packet_reassemble(radio_rx):
     """
     Non-blocking receive that reassembles fragmented packets.
     Returns (sender_id, reassembled_bytes) when complete, otherwise None.
-
-    ARQ: If radio_tx and tx_target are provided, a NACK is sent back to the sender
-    when the END marker arrives but some chunks are still missing.  The NACK frame
-    (SEQ=0xFFFD) carries the list of missing seq numbers (uint8 each).  The sender
-    retransmits only those chunks and re-sends END.  Up to ARQ_MAX_RETRIES NACKs
-    are attempted before the incomplete message is discarded.
     """
-    global _rx_buffers, _rx_timestamps, _rx_nack_counts
+    global _rx_buffers, _rx_timestamps
     
     if not radio_rx.receiveDone():
         return None
     
-    # Snapshot radio state into locals before any slow processing.
     sender_id = radio_rx.SENDERID
     rssi = radio_rx.RSSI
     data = radio_rx.DATA
-
+    
     if isinstance(data, (list, tuple)):
         data_bytes = bytes(data)
     else:
@@ -351,6 +332,7 @@ def receive_packet_reassemble(radio_rx, radio_tx=None, tx_target=None):
     print(f"[RX RAW] {sender_id}: RSSI={rssi} raw_len={len(data_bytes)}")
     
     if len(data_bytes) < 4:
+        radio_rx.receiveBegin()
         return None
     
     try:
@@ -358,20 +340,9 @@ def receive_packet_reassemble(radio_rx, radio_tx=None, tx_target=None):
         chunk = data_bytes[4:]
     except Exception as e:
         print(f"[RX ERROR] Failed to parse header: {e}")
+        radio_rx.receiveBegin()
         return None
-
-    # Ignore NACK frames — they are consumed by the sender side in send_packet.
-    if seq == ARQ_NACK_SEQ:
-        return None
-
-    # Reject packets whose sequence number is impossible for this protocol.
-    # Valid data chunks have seq in 1..255; the END marker uses seq=0xFFFF.
-    # Ghost/corrupt packets that slip past the hardware CRC consistently show
-    # seq == msgid at values like 2827, 8738, or 16448 — far outside this range.
-    if seq != 0xFFFF and (seq == 0 or seq > 255):
-        print(f"[RX DISCARD] {sender_id}: msgid={msgid} seq={seq} out of range, discarding")
-        return None
-
+    
     current_time = time.time()
     msg_key = (sender_id, msgid)
     
@@ -380,7 +351,6 @@ def receive_packet_reassemble(radio_rx, radio_tx=None, tx_target=None):
     for key in expired_keys:
         _rx_buffers.pop(key, None)
         _rx_timestamps.pop(key, None)
-        _rx_nack_counts.pop(key, None)
     
     if msg_key not in _rx_buffers:
         _rx_buffers[msg_key] = {}
@@ -393,52 +363,33 @@ def receive_packet_reassemble(radio_rx, radio_tx=None, tx_target=None):
         if len(chunk) < 4:
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
-            _rx_nack_counts.pop(msg_key, None)
+            radio_rx.receiveBegin()
             return None
         
         try:
             total_chunks, orig_len = struct.unpack(">HH", chunk[:4])
-        except Exception:
+        except Exception as e:
             _rx_buffers.pop(msg_key, None)
             _rx_timestamps.pop(msg_key, None)
-            _rx_nack_counts.pop(msg_key, None)
+            radio_rx.receiveBegin()
             return None
         
-        buf = _rx_buffers[msg_key]
-        chunks_received = len(buf)
-        received_seqs = sorted(buf.keys())
+        chunks_received = len(_rx_buffers[msg_key])
+        received_seqs = sorted(_rx_buffers[msg_key].keys())
         
         print(f"[RX DEBUG] {sender_id}: msgid={msgid} received {chunks_received}/{total_chunks} chunks: {received_seqs}")
         
         if chunks_received != total_chunks:
-            # Some chunks are missing — send a NACK if ARQ is enabled.
-            missing = [s for s in range(1, total_chunks + 1) if s not in buf]
-            nack_count = _rx_nack_counts.get(msg_key, 0)
-            if radio_tx is not None and tx_target is not None and nack_count < ARQ_MAX_RETRIES:
-                _rx_nack_counts[msg_key] = nack_count + 1
-                nack_header = struct.pack(">HH", msgid, ARQ_NACK_SEQ)
-                nack_payload = nack_header + bytes(missing)
-                print(f"[ARQ NACK] -> {tx_target}: msgid={msgid} missing={missing} (attempt {nack_count + 1}/{ARQ_MAX_RETRIES})")
-                # Mute RX during NACK transmission to avoid self-interference.
-                radio_rx.setMode(RF69_MODE_STANDBY)
-                try:
-                    radio_tx.send(tx_target, nack_payload)
-                except TypeError:
-                    radio_tx.send(tx_target, list(nack_payload))
-                radio_rx.receiveBegin()
-                # Keep the partial buffer and wait for retransmitted chunks.
-                return None
-            else:
-                print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")
-                _rx_buffers.pop(msg_key, None)
-                _rx_timestamps.pop(msg_key, None)
-                _rx_nack_counts.pop(msg_key, None)
-                return None
+            print(f"[RX ERROR] {sender_id}: msgid={msgid} expected {total_chunks}, got {chunks_received}. Dropping.")
+            _rx_buffers.pop(msg_key, None)
+            _rx_timestamps.pop(msg_key, None)
+            radio_rx.receiveBegin()
+            return None
         
         # Reassemble chunks in order (seq starts at 1, not 0)
         reassembled = b''
         for i in range(1, total_chunks + 1):
-            reassembled += buf[i]
+            reassembled += _rx_buffers[msg_key][i]
         
         reassembled = reassembled[:orig_len]
         
@@ -446,16 +397,17 @@ def receive_packet_reassemble(radio_rx, radio_tx=None, tx_target=None):
         
         _rx_buffers.pop(msg_key, None)
         _rx_timestamps.pop(msg_key, None)
-        _rx_nack_counts.pop(msg_key, None)
+        
+        radio_rx.receiveBegin()
         
         # Return the complete packet
         return (sender_id, reassembled)
     
     else:
         # Data chunk
-        buf = _rx_buffers[msg_key]
-        buf[seq] = chunk
+        _rx_buffers[msg_key][seq] = chunk
         print(f"[RX CHUNK] {sender_id}: msgid={msgid} seq={seq} chunk_len={len(chunk)}")
+        radio_rx.receiveBegin()
         return None
 
 def main():
@@ -475,6 +427,8 @@ def main():
     MODULE0 = RF69_433MHZ
     FREQUENCY0 = 433000000
 
+    packet_size = 62
+
     tun_file, ifname, ip = create_tun_for_node(NODE_ID)
     print(ifname, ip)
 
@@ -488,23 +442,15 @@ def main():
             tx_radio = setup_radios(MODULE1, FREQUENCY1, NODE_ID, NETWORK_ID, 18, 22, 0, 1)
 
         while True:
-            # Use select() to wait up to 1 ms for TUN data before checking the RX radio.
-            # This avoids busy-polling and replaces the old time.sleep(TOSLEEP) idle loop.
-            #
-            # Throughput math (for reference):
-            #   RFM69 at 250 kbps: 61-byte max payload => ~3 ms air-time per frame.
-            #   4-byte fragmentation header => 57 bytes of user data per frame.
-            #   MTU=120 bytes => ceil(120/57)=3 data frames + 1 END = 4 radio TXs per IP packet.
-            #   TOSLEEP=0.005 s per frame => ~200 frames/s => ~11 kB/s (~88 kbps effective).
-            #   Old TOSLEEP=0.064 gave only ~860 B/s (~6.8 kbps) — a 13× slowdown.
-            r, _, _ = select.select([tun_file], [], [], 0.001)
-            if r:
-                pkt = read_tun_nonblocking(tun_file)
-                if pkt is not None:
-                    send_packet(pkt, tx_radio, OTHERNODE, chunk_size=57, rx_radio=rx_radio)
 
-            # Non-blocking receive (packets from RX - write them to TUN)
-            result = receive_packet_reassemble(rx_radio, radio_tx=tx_radio, tx_target=OTHERNODE)
+            pkt = read_tun_nonblocking(tun_file)
+            if pkt is None:
+                pass
+            else:
+                send_packet(pkt, tx_radio, OTHERNODE, chunk_size=55, pause=0.1)
+
+			# Non-blocking receive (packets from RX - write them to TUN)
+            result = receive_packet_reassemble(rx_radio)
             if result is not None:
                 sender_id, reassembled_pkt = result
                 try:
@@ -512,6 +458,8 @@ def main():
                     print(f"[TUN WRITE] Wrote {len(reassembled_pkt)} bytes from {sender_id}")
                 except OSError as e:
                     print(f"[TUN ERROR] Failed to write: {e}")
+
+            time.sleep(TOSLEEP)
 
     except:
         print("Shutting down RFM69 modules")

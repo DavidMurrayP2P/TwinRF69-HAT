@@ -7,7 +7,6 @@
 # - uncomment GPIO.setboard() call and set correct board type
 
 from RFM69registers import *
-import collections
 import spidev
 import RPi.GPIO as GPIO
 import time
@@ -36,7 +35,6 @@ class RFM69(object):
         self.RSSI = 0
         self.DATA = []
         self.sendSleepTime = 0.05
-        self._rx_queue = collections.deque(maxlen=16)
 
         #GPIO.setboard(GPIO.ZERO)   # for Orange Pi, see https://pypi.org/project/OrangePi.GPIO/
         GPIO.setmode(GPIO.BOARD)
@@ -279,33 +277,30 @@ class RFM69(object):
         self.setMode(RF69_MODE_RX)
 
     def interruptHandler(self, pin):
+        self.intLock = True
         self.DATASENT = True
-        if self.readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY:
+        if self.mode == RF69_MODE_RX and self.readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY:
             self.setMode(RF69_MODE_STANDBY)
-            PAYLOADLEN, TARGETID, SENDERID, CTLbyte = self.spi.xfer2([REG_FIFO & 0x7f,0,0,0,0])[1:]
-            if PAYLOADLEN > 66:
-                PAYLOADLEN = 66
-            if not (self.promiscuousMode or TARGETID == self.address or TARGETID == RF69_BROADCAST_ADDR):
-                # Packet not addressed to us — re-arm and discard
-                self.writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01)
-                self.setMode(RF69_MODE_RX)
+            self.PAYLOADLEN, self.TARGETID, self.SENDERID, CTLbyte = self.spi.xfer2([REG_FIFO & 0x7f,0,0,0,0])[1:]
+            if self.PAYLOADLEN > 66:
+                self.PAYLOADLEN = 66
+            if not (self.promiscuousMode or self.TARGETID == self.address or self.TARGETID == RF69_BROADCAST_ADDR):
+                self.PAYLOADLEN = 0
+                self.intLock = False
                 return
-            DATALEN = PAYLOADLEN - 3
-            ACK_RECEIVED = CTLbyte & 0x80
-            ACK_REQUESTED = CTLbyte & 0x40
+            self.DATALEN = self.PAYLOADLEN - 3
+            self.ACK_RECEIVED = CTLbyte & 0x80
+            self.ACK_REQUESTED = CTLbyte & 0x40
 
-            DATA = self.spi.xfer2([REG_FIFO & 0x7f] + [0 for i in range(0, DATALEN)])[1:]
+            self.DATA = self.spi.xfer2([REG_FIFO & 0x7f] + [0 for i in range(0, self.DATALEN)])[1:]
 
-            RSSI = self.readRSSI()
-            #print(f"received {PAYLOADLEN} raw bytes from {SENDERID} ack={ACK_RECEIVED}")
-
-            # Buffer the packet and re-arm the receiver immediately so the radio
-            # is back in RX within microseconds — not waiting for the main loop.
-            self._rx_queue.append((SENDERID, TARGETID, RSSI, DATA, ACK_RECEIVED, ACK_REQUESTED, PAYLOADLEN))
-            self.writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01)
-            self.setMode(RF69_MODE_RX)
+            self.RSSI = self.readRSSI()
+            #print(f"received {self.PAYLOADLEN} raw bytes from {self.SENDERID} ack={self.ACK_RECEIVED}")
+        self.intLock = False
 
     def receiveBegin(self):
+        while self.intLock:
+            time.sleep(.1)
         self.DATALEN = 0
         self.SENDERID = 0
         self.TARGETID = 0
@@ -321,16 +316,8 @@ class RFM69(object):
         self.setMode(RF69_MODE_RX)
 
     def receiveDone(self):
-        if self._rx_queue:
-            SENDERID, TARGETID, RSSI, DATA, ACK_RECEIVED, ACK_REQUESTED, PAYLOADLEN = self._rx_queue.popleft()
-            self.SENDERID = SENDERID
-            self.TARGETID = TARGETID
-            self.RSSI = RSSI
-            self.DATA = DATA
-            self.ACK_RECEIVED = ACK_RECEIVED
-            self.ACK_REQUESTED = ACK_REQUESTED
-            self.PAYLOADLEN = PAYLOADLEN
-            self.DATALEN = PAYLOADLEN - 3
+        if (self.mode == RF69_MODE_RX or self.mode == RF69_MODE_STANDBY) and self.PAYLOADLEN > 0:
+            self.setMode(RF69_MODE_STANDBY)
             return True
         if self.readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_TIMEOUT:
             # https://github.com/russss/rfm69-python/blob/master/rfm69/rfm69.py#L112
@@ -342,14 +329,6 @@ class RFM69(object):
             return False
         self.receiveBegin()
         return False
-
-    def hasPacket(self):
-        return bool(self._rx_queue)
-
-    def getPacket(self):
-        if self._rx_queue:
-            return self._rx_queue.popleft()
-        return None
 
     def readRSSI(self, forceTrigger = False):
         rssi = 0
